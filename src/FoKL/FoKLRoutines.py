@@ -802,7 +802,7 @@ class FoKL:
         X[:, 0] = np.ones((n,))
         modells = np.zeros((n, draws))  # note n == np.shape(data)[0] if data != 'ignore'
         for i in range(draws):
-            modells[:, i] = np.matmul(X, betas[setnos[i], :])
+            modells[:, i] = np.transpose(np.matmul(X, np.transpose(np.array(betas[setnos[i], :]))))
         mean = np.mean(modells, 1)
 
         if current['ReturnBounds']:
