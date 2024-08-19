@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 from src.FoKL import FoKLRoutines
 
+# Create FoKL Object
 model = FoKLRoutines.FoKL()
 
 # For Graphing
@@ -13,8 +14,7 @@ import plotly.graph_objs as go
 import plotly.io as pio
 pio.renderers.default = "browser"
 
-# For BSS-ANOVA Model
-
+# Sigmoid Generation
 
 df = pd.DataFrame()
 
@@ -58,30 +58,26 @@ model.draws = 1000
 model.gimmie = False
 model.aic = False
 
-model.update = True
-model.built = False
-
 model.burnin = 0
-# Un-normalized and un-formatted 'raw' input variables of dataset:
 
+# New update hyperparamters
+model.update = True # To use update methodology, must be called PRIOR to first fitting
+model.built = False # Defines whether fresh model is created or prior model used
+model.burn = 500 # burn draws are disregarded prior to update fitting
 
-# Automatically normalize and format:
-model.cleanFun(inputs,data)
+x = inputs
+y = data
 
-x = model.inputs
-y = model.data
+# Call clean to format inputs, minmax MUST be specified when updating to avoid double normalization with fit calls
 
-model.inputs = model.inputs[0:4999]
-model.data = model.data[0:4999]
+model.clean(x[0:4999],y[0:4999], minmax=[[0,1],[0,1]])
 
-
+# First fitting
 model.fit()
 
-avg_betas = np.array(np.mean(model.betas, axis = 0))
+print('First Fit Completed')
 
-prediction= []
-
-mean, bounds, rmse  = model.coverage3(inputs=x, data = y)
+mean, bounds, rmse  = model.evaluate(inputs = x)
 
 # # Need to add test-betas[-1] because this is the constant value that doesn't get added in bss_eval
 df['prediction'] = (np.array(mean))
@@ -112,16 +108,17 @@ fig.add_trace(go.Scatter3d(
 
 fig.show()
 
-model.inputs = x[5000:-1]
+# Model inputs redefined
 model.data = y[5000:-1]
 
+# New inputs must be cleaned
+model.inputs = model.clean(x[5000:-1])
+
+# Second fitting
 model.fit()
 
-avg_betas = np.array(np.mean(model.betas, axis = 0))
-
-prediction= []
-
-mean, bounds, rmse  = model.coverage3(inputs=x, data = y)
+# Evaluation of new model
+mean= model.evaluate(inputs=x)
 
 # # Need to add test-betas[-1] because this is the constant value that doesn't get added in bss_eval
 df['prediction'] = (np.array(mean))
@@ -151,4 +148,3 @@ fig.add_trace(go.Scatter3d(
 ))
 
 fig.show()
-h = 1
