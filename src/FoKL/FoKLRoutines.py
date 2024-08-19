@@ -1,4 +1,14 @@
 from FoKL import getKernels
+
+import os
+import sys
+# # -----------------------------------------------------------------------
+# # # UNCOMMENT IF USING LOCAL FOKL PACKAGE:
+# dir = os.path.abspath(os.path.dirname(__file__))  # directory of script
+# sys.path.append(os.path.join(dir, '..', '..'))  # package directory
+# from src.FoKL import getKernels
+# from src.FoKL.fokl_to_pyomo import fokl_to_pyomo
+# # -----------------------------------------------------------------------
 import pandas as pd
 import warnings
 import itertools
@@ -8,10 +18,8 @@ from numpy import linalg as LA
 from scipy.linalg import eigh
 import matplotlib.pyplot as plt
 import time
-import os
 import pickle
-import pyomo.environ as pyo
-import sys
+import copy
 
 
 def load(filename, directory=None):
@@ -92,6 +100,13 @@ def _set_attributes(self, attrs):
         warnings.warn("Input must be a Python dictionary.")
     return
 
+
+def _merge_dicts(d1, d2):
+    """Merge two dictionaries into single dictionary in a backward-compatible way. Values of d2 replace any shared variables in d1."""
+    d = d1.copy()
+    d.update(d2)
+    return d
+    
 
 class FoKL:
     def __init__(self, **kwargs):
@@ -176,7 +191,7 @@ class FoKL:
 
         # Store list of hyperparameters for easy reference later, if sweeping through values in functions such as fit:
         self.hypers = ['kernel', 'phis', 'relats_in', 'a', 'b', 'atau', 'btau', 'tolerance', 'burnin', 'draws',
-                       'gimmie', 'way3', 'threshav', 'threshstda', 'threshstdb', 'aic', 'update']
+                       'gimmie', 'way3', 'threshav', 'threshstda', 'threshstdb', 'aic', 'update', 'built']
 
         # Store list of settings for easy reference later (namely, in 'clear'):
         self.settings = ['UserWarnings', 'ConsoleOutput']
@@ -187,8 +202,6 @@ class FoKL:
         # List of attributes to keep in event of clearing model (i.e., 'self.clear'):
         self.keep = ['keep', 'hypers', 'settings', 'kernels'] + self.hypers + self.settings + self.kernels
 
-        # List of hyperparameters different when applying update methodology
-        # self.updateHypers = ['sigsqd0','burn']
         # Process user's keyword arguments:
         default = {
                    # Hyperparameters:
@@ -197,13 +210,13 @@ class FoKL:
                    'threshav': 0.05, 'threshstda': 0.5, 'threshstdb': 2, 'aic': False,
 
                     # Hyperparameters with Update:
-                    'sigsqd0' : 0.5, 'burn': 500, 'update':False,
+                    'sigsqd0': 0.5, 'burn': 500, 'update': False, 'built' : False,
 
                    # Other:
                    'UserWarnings': True, 'ConsoleOutput': True
                    }
         current = _process_kwargs(default, kwargs)  # = default, but updated by any user kwargs
-        for boolean in ['gimmie', 'way3', 'aic', 'UserWarnings', 'ConsoleOutput', 'update']:
+        for boolean in ['gimmie', 'way3', 'aic', 'UserWarnings', 'ConsoleOutput']:
             if not (current[boolean] is False or current[boolean] is True):
                 current[boolean] = _str_to_bool(current[boolean])
 
@@ -231,47 +244,26 @@ class FoKL:
         for key, value in current.items():
             setattr(self, key, value)
 
-    def cleanFun(self, inputs, data=None, kwargs_from_other=None, **kwargs):
+    def _format(self, inputs, data=None, AutoTranspose=True, SingleInstance=False, bit=64):
         """
-        For cleaning and formatting inputs prior to training a FoKL model. Note that data is not required but should be
-        entered if available; otherwise, leave blank.
+        Called by 'clean' to format dataset.
+            - formats inputs as 2D ndarray, where columns are input variables; n_rows > n_cols if AutoTranspose=True
+            - formats data as 2D ndarray, with single column
 
-        Inputs:
-            inputs == [n x m] input matrix of n observations by m features (i.e., 'x' variables in model)
-            data   == [n x 1] output vector of n observations (i.e., 'y' variable in model)
-
-        Keyword Inputs:
-            bit               == floating point bits to represent dataset as               == 64 (default)
-            train             == percentage (0-1) of n datapoints to use for training      == 1 (default)
-            AutoTranspose     == boolean to transpose dataset so that instances > features == True (default)
-            kwargs_from_other == [NOT FOR USER] used internally by fit or evaluate function
-
-        Added Attributes:
-            - self.inputs    == 'inputs' as [n x m] numpy array where each column is normalized on [0, 1] scale
-            - self.data      == 'data' as [n x 1] numpy array
-            - self.normalize == [[min, max], ... [min, max]] factors used to normalize 'inputs' to 'self.inputs'
-            - self.trainlog  == indices of 'self.inputs' to use as training set
+        Note SingleInstance has priority over AutoTranspose. If SingleInstance=True, then AutoTranspose=False.
         """
+        # Format and check inputs:
+        AutoTranspose = _str_to_bool(AutoTranspose)
+        SingleInstance = _str_to_bool(SingleInstance)
+        bits = {16: np.float16, 32: np.float32, 64: np.float64}  # allowable datatypes: https://numpy.org/doc/stable/reference/arrays.scalars.html#arrays-scalars-built-in
+        if SingleInstance is True:
+            AutoTranspose = False
+        if bit not in bits.keys():
+            warnings.warn(f"Keyword 'bit={bit}' limited to values of 16, 32, or 64. Assuming default value of 64.", category=UserWarning)
+            bit = 64
+        datatype = bits[bit]
 
-        # Allowable datatypes (https://numpy.org/doc/stable/reference/arrays.scalars.html#arrays-scalars-built-in):
-        bits = {16: np.float16, 32: np.float32, 64: np.float64}
-
-        # Process keywords:
-        if kwargs_from_other is not None:  # then clean is being called from fit or evaluate function
-            kwargs = kwargs | kwargs_from_other  # merge dictionaries (kwargs={} is expected but just in case)
-        default = {'bit': 64, 'train': 1, 'AutoTranspose': True}
-        current = _process_kwargs(default, kwargs)
-        if current['bit'] not in bits.keys():
-            warnings.warn(f"Keyword 'bit={current['bit']}' limited to values of 16, 32, or 64. Assuming default value "
-                          f"of 64.", category=UserWarning)
-            current['bit'] = 64
-        current['AutoTranspose'] = _str_to_bool(current['AutoTranspose'])
-
-        # Define local variables from keywords:
-        datatype = bits[current['bit']]
-        train = current['train']  # percentage of datapoints to use as training data
-
-        # Convert 'inputs' and 'datas' to numpy if pandas:
+        # Convert 'inputs' and 'data' to numpy if pandas:
         if any(isinstance(inputs, type) for type in (pd.DataFrame, pd.Series)):
             inputs = inputs.to_numpy()
             warnings.warn("'inputs' was auto-converted to numpy. Convert manually for assured accuracy.",
@@ -283,33 +275,23 @@ class FoKL:
                               category=UserWarning)
 
         # Format 'inputs' as [n x m] numpy array:
-        inputs = np.array(inputs) # attempts to handle lists or any other format (i.e., not pandas)
-        inputs = np.squeeze(inputs) # removes axes with 1D for cases like (N x 1 x M) --> (N x M)
+        inputs = np.array(inputs)  # attempts to handle lists or any other format (i.e., not pandas)
+        if inputs.ndim > 2:  # remove axes with 1D for cases like (N x 1 x M) --> (N x M)
+            inputs = np.squeeze(inputs)
         if inputs.dtype != datatype:
             inputs = np.array(inputs, dtype=datatype)
-            warnings.warn(f"'inputs' was converted to float{current['bit']}. May require user-confirmation that "
+            warnings.warn(f"'inputs' was converted to float{bit}. May require user-confirmation that "
                           f"values did not get corrupted.", category=UserWarning)
         if inputs.ndim == 1:  # if inputs.shape == (number,) != (number,1), then add new axis to match FoKL format
-            inputs = inputs[:, np.newaxis]
-        if current['AutoTranspose'] is True:
+            if SingleInstance is True:
+                inputs = inputs[np.newaxis, :]  # make 1D into (1, M)
+            else:
+                inputs = inputs[:, np.newaxis]  # make 1D into (N, 1)
+        if AutoTranspose is True and SingleInstance is False:
             if inputs.shape[1] > inputs.shape[0]:  # assume user is using transpose of proper format
                 inputs = inputs.transpose()
                 warnings.warn("'inputs' was transposed. Ignore if more datapoints than input variables, else set "
                               "'AutoTranspose=False' to disable.", category=UserWarning)
-
-        # Normalize 'inputs' to [0, 1] scale:
-        inputs_max = np.max(inputs, axis=0) # max of each input variable
-        normalize = []
-        for m in range(inputs.shape[1]):  # for input var in input vars, to check each var's normalization status
-            inputs_min = np.min(inputs[:, m])
-            if inputs_max[m] != 1 or inputs_min != 0:
-                if inputs_min == inputs_max[m]:
-                    warnings.warn("'inputs' contains a column of constants which will not improve the model's fit."
-                                  , category=UserWarning)
-                    inputs[:, m] = np.ones_like(inputs[:, m])
-                else:  # normalize
-                    inputs[:, m] = (inputs[:, m] - inputs_min) / (inputs_max[m] - inputs_min)
-            normalize.append([inputs_min, inputs_max[m]])  # store [min, max] for post-processing convenience
 
         # Format 'data' as [n x 1] numpy array:
         if data is not None:
@@ -317,7 +299,7 @@ class FoKL:
             data = np.squeeze(data)
             if data.dtype != datatype:
                 data = np.array(data, dtype=datatype)
-                warnings.warn(f"'data' was converted to float{current['bit']}. May require user-confirmation that "
+                warnings.warn(f"'data' was converted to float{bit}. May require user-confirmation that "
                               f"values did not get corrupted.", category=UserWarning)
             if data.ndim == 1:  # if data.shape == (number,) != (number,1), then add new axis to match FoKL format
                 data = data[:, np.newaxis]
@@ -329,15 +311,199 @@ class FoKL:
                 elif m != 1 and n == 1:
                     data = data.transpose()
                     warnings.warn("'data' was transposed to match FoKL formatting.", category=UserWarning)
+                
+        return inputs, data
+    
+    def _normalize(self, inputs, minmax=None, pillow=None, pillow_type='percent'):
+        """
+        Called by 'clean' to normalize dataset inputs.
 
-        # Index percentage of dataset as training set:
-        trainlog = self.generate_trainlog(train, inputs.shape[0])
+        Inputs:
+            inputs      == [n x m] ndarray where columns are input variables
+            minmax      == list of [min, max] lists; upper/lower bounds of each input variable                      == self.minmax (default)
+            pillow      == list of [lower buffer, upper buffer] lists; fraction of span by which to expand 'minmax' == 0 (default)
+            pillow_type == string, 'percent' (i.e., fraction of span to buffer truescale) or 'absolute' (i.e., [min, max] on 0-1 scale), defining units of 'pillow' == 'percent' (default)
+            
+        Note 'pillow' is ignored if reading 'minmax' from previously defined 'self.minmax'; a warning is thrown if 'pillow' is defined in this case.
+        
+        Updates 'self.minmax'.
+        """
+        mm = inputs.shape[1]  # number of input variables
+        
+        # Process 'pillow_type':
+        pillow_types = ['percent', 'absolute']
+        if isinstance(pillow_type, str):
+            pillow_type = [pillow_type] * mm
+        elif isinstance(pillow_type, list):
+            if len(pillow_type) != mm:
+                raise ValueError("Input 'pillow_type' must be string or correspond to input variables (i.e., columns of 'inputs').")
+        for pt in range(len(pillow_type)):
+            if pillow_type[pt] not in pillow_types:
+                raise ValueError(f"'pillow_type' is limited to {pillow_types}.")
 
-        # Define/update attributes with cleaned data and other relevant variables:
-        attrs = {'inputs': inputs, 'data': data, 'normalize': normalize, 'trainlog': trainlog}
-        _set_attributes(self, attrs)
+        # Process 'pillow':
 
-        return
+        _skip_pillow = False  # to skip pillow's adjustment of minmax, if pillow is default
+        if pillow is None:  # default
+            _skip_pillow = True
+            pillow = 0.0
+        if isinstance(pillow, int):  # scalar was provided
+            pillow = float(pillow)
+        if isinstance(pillow, float):
+            pillow = [[pillow, pillow]] * mm
+        elif isinstance(pillow[0], int) or isinstance(pillow[0], float):  # list was provided
+            lp = len(pillow)
+            if lp == 2:  # assume [lb, ub] was provided
+                pillow = [[float(pillow[0]), float(pillow[1])]]  # add outer list, and ensure float
+                lp = 1  # = len(pillow)
+            if lp != int(mm * 2):
+                raise ValueError("Input 'pillow' must correspond to input variables (i.e., columns of 'inputs').")
+            else:  # assume [lb1, ub1, ..., lbm, upm] needs to be formatted to [[lb1, ub1], ..., [lbm, ubm]]
+                pillow_vals = copy.deepcopy(pillow)
+                pillow = []
+                for i in range(0, lp, 2):
+                    pillow.append([float(pillow_vals[i]), float(pillow_vals[i + 1])])  # list of [lb, ub] lists
+        
+        # Process 'minmax':
+        
+        def _minmax_error():
+            raise ValueError("Input 'minmax' must correspond to input variables (i.e., columns of 'inputs').")
+
+        if minmax is None:  # default, read 'model.normalize' or define if does not exist
+            if hasattr(self, 'minmax'):
+                minmax = self.minmax
+            else:
+                minmax = list([np.min(inputs[:, m]), np.max(inputs[:, m])] for m in range(mm))
+        else:  # process 'minmax'
+            if isinstance(minmax[0], int) or isinstance(minmax[0], float):  # list was provided
+                lm = len(minmax)
+                if lm == 2:  # assume [min, max] was provided
+                    minmax = [minmax]  # add outer list
+                    lm = 1  # = len(minmax)
+                if lm != int(mm * 2):
+                    _minmax_error()
+                else:  # assume [min1, max1, ..., minm, maxm] needs to be formatted to [[min1, max1], ..., [minm, maxm]]
+                    minmax_vals = copy.deepcopy(minmax)
+                    minmax = []
+                    for i in range(0, lm, 2):
+                        minmax.append([minmax_vals[i], minmax_vals[i + 1]])  # list of [min, max] lists
+            elif len(minmax) != mm:
+                _minmax_error()
+
+        if pillow is not None and _skip_pillow is False:
+            minmax_vals = copy.deepcopy(minmax)
+            minmax = []
+            for m in range(mm):  # for input var in input vars
+                x_min = minmax_vals[m][0]
+                x_max = minmax_vals[m][1]
+                span = x_max - x_min  # span of minmax
+                if pillow_type[m] == 'percent':
+                    minmax.append([x_min - span * pillow[m][0], x_max + span * pillow[m][1]])  # [min, max] with pillow buffers
+                elif pillow_type[m] == 'absolute':
+                    # Derivation:
+                    #   Nomenclature: pillow[m] == [q, 1 - p], minmax_vals[m] == [n, m]
+                    #   For [q, 1 - p] to align to 0-1 scale after normalization,
+                    #       (n - min) / (max - min) = q
+                    #       (m - min) / (max - min) = p
+                    #   Then,
+                    #       (n - min) / q = (m - min) / p
+                    #       n / q - m / p = min * (1 / q - 1 / p)
+                    #       min = (n / q - m / p) / (1 / q - 1 / p) = (n * p - m * q) / (p - q)
+                    #   And,
+                    #       max = (n - min) / q + min
+                    
+                    if pillow[m][0] == 0:  # then n = min
+                        minmax_min = x_min
+                    else:  # see above equation
+                        minmax_min = (x_min * (1 - pillow[m][1]) - x_max * pillow[m][0]) / (1 - pillow[m][1] - pillow[m][0])
+                    
+                    if pillow[m][1] == 0:  # then m = max
+                        minmax_max = x_max
+                    elif pillow[m][0] == 0:  # empirically need equation rearranged in this case to avoid nan
+                        minmax_max = (x_max - pillow[m][1] * minmax_min) / (1 - pillow[m][1])
+                    else:  # see above equation
+                        minmax_max = (x_min - minmax_min) / pillow[m][0] + minmax_min
+                    
+                    minmax.append([minmax_min, minmax_max])  # [min, max] such that 'pillow' values map to 0-1 scale
+            
+        if hasattr(self, 'minmax'):  # check if 'self.minmax' is defined, in which case give warning to re-train model
+            if any(minmax[m] == self.minmax[m] for m in range(mm)) is False:
+                warnings.warn("The model already contains normalization [min, max] bounds, so the currently trained model will not be valid for the new bounds requested. Train a new model with these new bounds.", category=UserWarning)
+        self.minmax = minmax  # always update
+
+        # Normalize 'inputs' to 0-1 scale according to 'minmax':
+        for m in range(mm):  # for input var in input vars
+            inputs[:, m] = (inputs[:, m] - minmax[m][0]) / (minmax[m][1] - minmax[m][0])
+        
+        return inputs
+    
+    def clean(self, inputs, data=None, kwargs_from_other=None, _setattr=False, **kwargs):
+        """
+        For cleaning and formatting inputs prior to training a FoKL model. Note that data is not required but should be
+        entered if available; otherwise, leave blank.
+
+        Inputs:
+            inputs == [n x m] input matrix of n observations by m features (i.e., 'x' variables in model)
+            data   == [n x 1] output vector of n observations (i.e., 'y' variable in model)
+
+        Keyword Inputs:
+            _setattr          == [NOT FOR USER] defines 'self.inputs' and 'self.data' if True == False (default)
+            train             == percentage (0-1) of n datapoints to use for training      == 1 (default)
+            AutoTranspose     == boolean to transpose dataset so that instances > features == True (default)
+            SingleInstance    == boolean to make 1D vector (e.g., list) into (1,m) ndarray == False (default)
+            bit               == floating point bits to represent dataset as               == 64 (default)
+            normalize         == boolean to pass formatted dataset to '_normalize'         == True (default)
+            minmax            == list of [min, max] lists; upper/lower bounds of each input variable == self.minmax (default)
+            pillow            == list of [lower buffer, upper buffer] lists; fraction of span by which to expand 'minmax' == 0 (default)
+            kwargs_from_other == [NOT FOR USER] used internally by fit or evaluate function
+
+        Added Attributes:
+            - self.inputs    == 'inputs' as [n x m] numpy array where each column is normalized on [0, 1] scale
+            - self.data      == 'data' as [n x 1] numpy array
+            - self.minmax    == [[min, max], ... [min, max]] factors used to normalize 'inputs' to 'self.inputs'
+            - self.trainlog  == indices of 'self.inputs' to use as training set
+        """
+        # Process keywords:
+        default = {'train': 1, 
+                   # For '_format':
+                   'AutoTranspose': True, 'SingleInstance': False, 'bit': 64,
+                   # For '_normalize':
+                   'normalize': True, 'minmax': None, 'pillow': None, 'pillow_type': 'percent'}
+        if kwargs_from_other is not None:  # then clean is being called from fit or evaluate function
+            kwargs = _merge_dicts(kwargs, kwargs_from_other)  # merge dictionaries (kwargs={} is expected but just in case)
+        current = _process_kwargs(default, kwargs)
+        current['normalize'] = _str_to_bool(current['normalize'])
+
+
+
+        # Format and normalize:
+        inputs, data = self._format(inputs, data, current['AutoTranspose'], current['SingleInstance'], current['bit'])
+        if current['normalize'] is True:
+            inputs = self._normalize(inputs, current['minmax'], current['pillow'], current['pillow_type'])
+        
+            # Check if any 'inputs' exceeds [0, 1], since 'normalize=True' implies this is desired:
+            inputs_cap0 = inputs < 0
+            inputs_cap1 = inputs > 1
+            if np.max(inputs_cap0) is True or np.max(inputs_cap1) is True:
+                warnings.warn("'inputs' exceeds [0, 1] normalization bounds. Capping values at 0 and 1.")
+                inputs[inputs_cap0] = 0.0  # cap at 0
+                inputs[inputs_cap1] = 1.0  # cap at 1
+
+        # Define full dataset with training log as attributes when clean called from fit, or when clean called for first time:
+        if hasattr(self, 'inputs') is False or _setattr is True:
+
+            # Index percentage of dataset as training set:
+            trainlog = self.generate_trainlog(current['train'], inputs.shape[0])
+
+            # Define/update attributes with cleaned data and other relevant variables:
+            attrs = {'inputs': inputs, 'data': data, 'trainlog': trainlog}
+            _set_attributes(self, attrs)
+
+        # Return formatted and possibly normalized dataset, depending on if user passed 'inputs' only or 'inputs' and 'data':
+        if data is None:  # assume user only wants 'inputs' returned, e.g., 'clean_dataset = model.clean(dataset)'
+            return inputs
+        else:  # e.g., 'clean_inputs, clean_data = model.clean(inputs, data)'
+            return inputs, data
 
     def generate_trainlog(self, train, n=None):
         """Generate random logical vector of length 'n' with 'train' percent as True."""
@@ -354,11 +520,11 @@ class FoKL:
                 np.random.shuffle(trainlog_i)  # randomize sort
             if len(trainlog_i) > l_log:
                 trainlog_i = trainlog_i[0:l_log]  # cut-off extra indices (beyond 'percent')
-            trainlog = np.zeros(n, dtype=np.bool)  # indices of training data (as a logical)
+            trainlog = np.zeros(n, dtype=bool)  # indices of training data (as a logical)
             for i in trainlog_i:
                 trainlog[i] = True
         else:
-            # trainlog = np.ones(n, dtype=np.bool)  # wastes memory, so use following method coupled with 'trainset':
+            # trainlog = np.ones(n, dtype=bool)  # wastes memory, so use following method coupled with 'trainset':
             trainlog = None  # means use all observations
         return trainlog
 
@@ -432,7 +598,7 @@ class FoKL:
             betas     == draw from the posterior distribution of coefficients            == self.betas (default)
             phis      == spline coefficients for the basis functions                     == self.phis (default)
             mtx       == basis function interaction matrix from the best model           == self.mtx (default)
-            normalize == list of [min, max]'s of input data used in the normalization    == self.normalize (default)
+            minmax    == list of [min, max]'s of input data used in the normalization    == self.minmax (default)
             IndividualDraws == boolean for returning derivative(s) at each draw       == 0 (default)
             ReturnFullArray == boolean for returning NxMx2 array instead of Nx2M      == 0 (default)
 
@@ -449,7 +615,7 @@ class FoKL:
 
         # Process keywords:
         default = {'inputs': None, 'kernel': self.kernel, 'd1': None, 'd2': None, 'draws': self.draws, 'betas': None,
-                   'phis': None, 'mtx': self.mtx, 'normalize': self.normalize, 'IndividualDraws': False,
+                   'phis': None, 'mtx': self.mtx, 'minmax': self.minmax, 'IndividualDraws': False,
                    'ReturnFullArray': False, 'ReturnBasis': False}
         current = _process_kwargs(default, kwargs)
         for boolean in ['IndividualDraws', 'ReturnFullArray', 'ReturnBasis']:
@@ -472,7 +638,7 @@ class FoKL:
         betas = current['betas']
         phis = current['phis']
         mtx = current['mtx']
-        span = current['normalize']
+        span = current['minmax']
 
         inputs = np.array(inputs)
         if inputs.ndim == 1:
@@ -687,16 +853,21 @@ class FoKL:
         Optional Inputs:
             betas        == coefficients defining FoKL model                       == self.betas (default)
             mtx          == interaction matrix defining FoKL model                 == self.mtx (default)
-            normalize    == [min, max] of inputs used for normalization            == None (default)
+            minmax       == [min, max] of inputs used for normalization            == None (default)
             draws        == number of beta terms used                              == self.draws (default)
             clean        == boolean to automatically normalize and format 'inputs' == False (default)
             ReturnBounds == boolean to return confidence bounds as second output   == False (default)
         """
 
         # Process keywords:
-        default = {'normalize': None, 'draws': self.draws, 'clean': False, 'ReturnBounds': False}
-        default_for_clean = {'bit': 64, 'train': 1}
-        current = _process_kwargs(default | default_for_clean, kwargs)
+        default = {'minmax': None, 'draws': self.draws, 'clean': False, 'ReturnBounds': False,  # for evaluate
+                   '_suppress_normalization_warning': False}                                    # if called from coverage3
+        default_for_clean = {'train': 1, 
+                             # For '_format':
+                             'AutoTranspose': True, 'SingleInstance': False, 'bit': 64,
+                             # For '_normalize':
+                             'normalize': True, 'minmax': None, 'pillow': None, 'pillow_type': 'percent'}
+        current = _process_kwargs(_merge_dicts(default, default_for_clean), kwargs)
         for boolean in ['clean', 'ReturnBounds']:
             current[boolean] = _str_to_bool(current[boolean])
         kwargs_to_clean = {}
@@ -742,21 +913,12 @@ class FoKL:
                               category=UserWarning)
                 current['clean'] = False
         else:  # user-defined 'inputs'
-            if not current['clean']:  # assume provided inputs are already formatted and maybe normalized
-                if not isinstance(inputs, np.ndarray):
-                    warnings.warn(f"Provided inputs were converted to numpy array as float64. To change this datatype, "
-                                  f"call 'clean' first.", category=UserWarning)
-                    inputs = np.array(inputs, dtype=np.float64)
-                if current['normalize'] is None:  # assume already normalized
-                    normputs = inputs
-                else:  # assume not normalized
-                    normputs = (inputs - current['normalize'][0]) / (current['normalize'][1] - current['normalize'][0])
-                if np.max(normputs) > 1 or np.min(normputs) < 0:
-                    warnings.warn("Provided inputs were not normalized, so overriding 'clean' to True.")
-                    current['clean'] = True
+            if not current['clean']:  # assume provided inputs are already formatted and normalized
+                normputs = inputs
+                if current['_suppress_normalization_warning'] is False:  # to suppress warning when evaluate called from coverage3
+                    warnings.warn("User-provided 'inputs' but 'clean=False'. Subsequent errors may be solved by enabling automatic formatting and normalization of 'inputs' via 'clean=True'.", category=UserWarning)
         if current['clean']:
-            self.clean(inputs, kwargs_from_other=kwargs_to_clean)
-            normputs = self.inputs
+            normputs = self.clean(inputs, kwargs_from_other=kwargs_to_clean)
         elif inputs is None:
             normputs = self.inputs
         else:
@@ -943,7 +1105,7 @@ class FoKL:
         data = current['data']
         draws = current['draws']
 
-        mean, bounds = self.evaluate(normputs, draws=draws, ReturnBounds=1)
+        mean, bounds = self.evaluate(normputs, draws=draws, ReturnBounds=1, _suppress_normalization_warning=True)
         n, mputs = np.shape(normputs)  # Size of normalized inputs ... calculated in 'evaluate' but not returned
 
         if current['plot']:  # if user requested a plot
@@ -953,8 +1115,8 @@ class FoKL:
             elif isinstance(current['xaxis'], int):  # if user-defined but not a vector
                 try:
                     normputs_np = np.array(normputs)  # in case list
-                    min = self.normalize[current['xaxis']][0]
-                    max = self.normalize[current['xaxis']][1]
+                    min = self.minmax[current['xaxis']][0]
+                    max = self.minmax[current['xaxis']][1]
                     plt_x = normputs_np[:, current['xaxis']] * (max - min) + min  # un-normalized vector for x-axis
                 except:
                     warnings.warn(f"Keyword argument 'xaxis'={current['xaxis']} failed to index 'inputs'. Plotting indices instead.",
@@ -1038,7 +1200,11 @@ class FoKL:
         default_for_fit = {'ConsoleOutput': True}
         default_for_fit['ConsoleOutput'] = _str_to_bool(kwargs.get('ConsoleOutput', self.ConsoleOutput))
         default_for_fit['clean'] = _str_to_bool(kwargs.get('clean', False))
-        default_for_clean = {'bit': 64, 'train': 1}
+        default_for_clean = {'train': 1, 
+                             # For '_format':
+                             'AutoTranspose': True, 'SingleInstance': False, 'bit': 64,
+                             # For '_normalize':
+                             'normalize': True, 'minmax': None, 'pillow': None, 'pillow_type': 'percent'}
         expected = self.hypers + list(default_for_fit.keys()) + list(default_for_clean.keys())
         kwargs = _process_kwargs(expected, kwargs)
         if default_for_fit['clean'] is False:
@@ -1071,7 +1237,7 @@ class FoKL:
                     _, data = self.trainset()
             except Exception as exception:
                 error_clean_failed = True
-            self.cleanFun(inputs, data, kwargs_from_other=kwargs_to_clean)
+            self.clean(inputs, data, kwargs_from_other=kwargs_to_clean, _setattr=True)
         else:  # user input implies that they already called clean prior to calling fit
             try:
                 if inputs is None:  # assume clean already called and len(data) same as train data if data not None
@@ -1085,7 +1251,7 @@ class FoKL:
                     error_clean_failed = True
                 else:
                     default_for_fit['clean'] = True
-                    self.cleanFun(inputs, data, kwargs_from_other=kwargs_to_clean)
+                    self.clean(inputs, data, kwargs_from_other=kwargs_to_clean, _setattr=True)
         if error_clean_failed is True:
             raise ValueError("'inputs' and/or 'data' were not provided so 'clean' could not be performed.")
 
@@ -1113,9 +1279,6 @@ class FoKL:
         threshstdb = self.threshstdb
         aic = self.aic
 
-        if self.update == True:
-            self.betas, self.mtx, self.evs = self.fitupdate(inputs, data)
-            return self.betas, self.mtx, self.evs
 
 
         # Update 'b' and/or 'btau' if set to default:
@@ -1161,6 +1324,10 @@ class FoKL:
             xsm = inputs
 
         # [BEGIN] initialization of constants (for use in gibbs to avoid repeat large calculations):
+
+        if self.update == True:
+            self.betas, self.mtx, self.evs = self.fitupdate(inputs, data)
+            return self.betas, self.mtx, self.evs
 
         # initialize tausqd at the mode of its prior: the inverse of the mode of sigma squared, such that the
         # initial variance for the betas is 1
@@ -1588,117 +1755,9 @@ class FoKL:
 
         return
 
-    def to_pyomo(self, m=None, y=None, x=None, **kwargs):
-        """
-        Automatically convert a pre-trained FoKL model to constraints for a symbolic Pyomo model.
-
-        Optional Inputs:
-            - m               == Pyomo model (if already defined)
-            - y               == FoKL output to include in Pyomo model (if known)
-            - x               == FoKL input variables to include in Pyomo model (if known), e.g., x=[0.7, None, 0.4]
-
-        Keywords:
-            - draws == number of scenarios to include as Pyomo constraints == model.draws (default)
-
-        Output:
-            - m == Pyomo model with FoKL model included
-                - m.y    == evaluated output corresponding to FoKL model
-                - m.x[j] == input variable corresponding to FoKL model
-
-        Note:
-            - Only convert FoKL models defined with the 'Bernoulli Polynomials' kernel; otherwise, with 'Cubic
-            Splines', the solution time is extremely impractical even for the simplest of models.
-        """
-        # Process kwargs:
-        default = {'draws': self.draws}
-        current = _process_kwargs(default, kwargs)
-
-        # Convert FoKL to Pyomo:
-
-        t = np.array(self.mtx - 1, dtype=int)  # indices of polynomial (where 0 is B1 and -1 means none)
-        lt = t.shape[0] + 1  # length of terms (including beta0)
-        lv = t.shape[1]  # length of input variables
-
-        ni_ids = []  # orders of basis functions used (where 0 is B1), per term
-        basis_n = []  # for future use when indexing 'm.fokl_basis'
-        for j in range(lv):  # for input variable in input variables
-            ni_ids.append(np.sort(np.unique(t[:, j][t[:, j] != -1])).tolist())
-            basis_n += ni_ids[j]
-        n_ids = np.sort(np.unique(basis_n))
-
-        if self.kernel != self.kernels[1]:
-            raise ValueError("The method for the 'Cubic Splines' kernel has not yet been ported from development, nor "
-                             "is expected to be as the resulting symbolic expressions are too infeasible to solve. Use "
-                             "the 'to_pyomo' method with a FoKL model trained on the 'Bernoulli Polynomials' kernel.")
-
-        m.fokl_expr = pyo.Expression(m.fokl_scenarios)  # FoKL models (i.e., scenarios, draws)
-        symbolic_fokl(m)  # may be better to write as rule
-
-        m.fokl_scenarios = pyo.Set(initialize=range(current['draws']))  # index for scenario (i.e., FoKL draw)
-        m.fokl_y = pyo.Var(m.fokl_scenarios, within=pyo.Reals)  # FoKL output
-
-        m.fokl_j = pyo.Set(initialize=range(lv))  # index for FoKL input variable
-        m.fokl_x = pyo.Var(m.fokl_j, within=pyo.Reals, bounds=[0, 1], initialize=0.0)  # FoKL input variables
-
-        basis_nj = []
-        for j in m.fokl_j:
-            for n in ni_ids[j]:  # for order of basis function in unique orders, per current input variable 'm.x[j]'
-                basis_nj.append([n, j])
-
-        def symbolic_basis(m):
-            """Basis functions as symbolic. See 'evaluate_basis' for source of equation."""
-            for [n, j] in basis_nj:
-                m.fokl_basis[n, j] = self.phis[n][0] + sum(self.phis[n][k] * (m.fokl_x[j] ** k)
-                                                           for k in range(1, len(self.phis[n])))
-            return
-
-        m.fokl_basis = pyo.Expression(basis_nj)  # create indices ONLY for used basis functions
-        symbolic_basis(m)  # may be better to write as rule, but 'pyo.Expression(basis_nj, rule=basis)' failed
-
-        m.fokl_k = pyo.Set(initialize=range(lt))  # index for FoKL term (where 0 is beta0)
-        m.fokl_b = pyo.Var(m.fokl_scenarios, m.fokl_k)  # FoKL coefficients (i.e., betas)
-        for i in m.fokl_scenarios:  # for scenario (i.e., draw) in scenarios (i.e., draws)
-            for k in m.fokl_k:  # for term in terms
-                m.fokl_b[i, k].fix(self.betas[-(i + 1), k])  # define values of betas, with y[0] as last FoKL draws
-
-        def symbolic_fokl(m):
-            """FoKL models (i.e., scenarios) as symbolic, assuming 'Bernoulli Polynomials."""
-            for i in m.fokl_scenarios:  # for scenario (i.e., draw) in scenarios (i.e., draws)
-                m.fokl_expr[i] = m.fokl_b[i, 0]  # initialize with beta0
-                for k in range(1, lt):  # for term in non-zeros terms (i.e., exclude beta0)
-                    tk = t[k - 1, :]  # interaction matrix of current term
-                    tk_mask = tk != -1  # ignore if -1 (recall -1 basis function means none)
-                    if any(tk_mask):  # should always be true because FoKL 'fit' removes rows from 'mtx' without basis
-                        term_k = m.fokl_b[i, k]
-                        for j in m.fokl_j:  # for input variable in input variables
-                            if tk_mask[j]:  # for variable in term
-                                term_k *= m.fokl_basis[tk[j], j]  # multiply basis function(s) with beta to form term
-                    else:
-                        term_k = 0
-                    m.fokl_expr[i] += term_k  # add term to expression
-            return
-
-        m.fokl_expr = pyo.Expression(m.fokl_scenarios)  # FoKL models (i.e., scenarios, draws)
-        symbolic_fokl(m)  # may be better to write as rule
-
-        def symbolic_scenario(m):
-            """Define each scenario, meaning a different draw of 'betas' for y=f(x), as a constraint."""
-            for i in m.fokl_scenarios:
-                m.fokl_constr[i] = m.fokl_y[i] == m.fokl_expr[i]
-            return
-
-        m.fokl_constr = pyo.Constraint(m.fokl_scenarios)  # set of constraints, one per scenario
-        symbolic_scenario(m)  # may be better to write as rule
-
-        if y is not None:
-            for i in m.fokl_scenarios:
-                m.fokl_y[i].fix(y)
-        for j in m.fokl_j:
-            if x is not None:
-                if x[j] is not None:
-                    m.fokl_x[j].fix(x[j])
-
-        return m
+    def to_pyomo(self, xvars, yvars, m=None, xfix=None, yfix=None, truescale=True, std=True, draws=None):
+        """Passes arguments to external function. See 'fokl_to_pyomo' for more documentation."""
+        return fokl_to_pyomo(self, xvars, yvars, m, xfix, yfix, truescale, std, draws)
 
     def save(self, filename=None, directory=None):
         """
@@ -1740,740 +1799,741 @@ class FoKL:
         time.sleep(1)  # so that next saved model is guaranteed a different filename
 
         return filepath
-        ## UPDATE METHODS
+
+# Beginning of UPDATE Code:
 
     def fitupdate(self, inputs, data):
-        """
-        this version uses the 'Xin' mode of the gibbs sampler
-
-        builds a single-output bss-anova emulator for a stationary dataset in an
-        automated fashion
-
-        function inputs:
-        'sigsqd0' is the initial guess for the obs error variance
-
-        'inputs' is the set of inputs normalized on [0,1]: matrix or numpy array
-        with columns corresponding to inputs and rows the different experimental designs
-
-        'data' are the output dataset used to build the function: column vector,
-        with entries corresponding to rows of 'inputs'
-
-        'relats' is a boolean matrix indicating which terms should be excluded
-        from the model building; for instance if a certain main effect should be
-        excluded relats will include a row with a 1 in the column for that input
-        and zeros elsewhere; if a certain two way interaction should be excluded
-        there should be a row with ones in those columns and zeros elsewhere
-        to exclude no terms 'relats = np.array([[0]])'. An example of excluding
-        the first input main effect and its interaction with the third input for
-        a case with three total inputs is:'relats = np.array([[1,0,0],[1,0,1]])'
-
-        'phis' are a data structure with the spline coefficients for the basis
-        functions, built with 'spline_coefficient.txt' and 'splineconvert' or
-        'spline_coefficient_500.txt' and 'splineconvert500' (the former provides
-        25 basis functions: enough for most things -- while the latter provides
-        500: definitely enough for anything)
-
-        'a' and 'b' are the shape and scale parameters of the ig distribution for
-        the observation error variance of the data. the observation error model is
-        white noise choose the mode of the ig distribution to match the noise in
-        the output dataset and the mean to broaden it some
-
-        'atau' and 'btau' are the parameters of the ig distribution for the 'tau
-        squared' parameter: the variance of the beta priors is iid normal mean
-        zero with variance equal to sigma squared times tau squared. tau squared
-        must be scaled in the prior such that the product of tau squared and sigma
-        squared scales with the output dataset
-
-        'tolerance' controls how hard the function builder tries to find a better
-        model once adding terms starts to show diminishing returns. a good
-        default is 3 -- large datasets could benefit from higher values
-
-        'draws' is the total number of draws from the posterior for each tested
-        model
-
-        'draws' is the total number of draws from the posterior for each tested
-
-        'gimmie' is a boolean causing the routine to return the most complex
-        model tried instead of the model with the optimum bic
-
-        'aic' is a boolean specifying the use of the aikaike information
-        criterion
-
-        function outputs:
-
-        'betas' are a draw from the posterior distribution of coefficients: matrix,
-        with rows corresponding to draws and columns corresponding to terms in the
-        GP
-
-        'mtx' is the basis function interaction matrix from the best model:
-        matrix, with rows corresponding to terms in the GP (and thus to the
-        columns of 'betas' and columns corresponding to inputs). A given entry in
-        the matrix gives the order of the basis function appearing in a given term
-        in the GP.
-        All basis functions indicated on a given row are multiplied together.
-        a zero indicates no basis function from a given input is present in a
-        given term.
-
-        'ev' is a vector of BIC values from all the models evaluated
-        """
-        phis = self.phis
-        relats_in = self.relats_in
-        a = self.a
-        b = self.b
-        atau = self.atau
-        btau = self.btau
-        tolerance = self.tolerance
-        draws = self.burnin + self.draws  # after fitting, the 'burnin' draws will be discarded from 'betas'
-        gimmie = self.gimmie
-        way3 = self.way3
-        aic = self.aic
-        burn = self.burn
-        sigsqd0 = self.sigsqd0
-
-
-        def modelBuilder():
-            if self.built:
-                model = True
-                mu_old = np.asmatrix(np.mean(self.betas[self.burn:-1], axis=0))
-                sigma_old = np.cov(self.betas[self.burn:-1].transpose())
-            else:
-                model = False
-                mu_old = []
-                sigma_old = []
-            return model, mu_old, sigma_old
-
-
-        def perms(x):
-            """Python equivalent of MATLAB perms."""
-            # from https://stackoverflow.com/questions/38130008/python-equivalent-for-matlabs-perms
-            a = np.vstack(list(itertools.permutations(x)))[::-1]
-
-            return a
-
-        def gibbs_Xin_update(sigsqd0, inputs, data, phis, Xin, discmtx, a, b, atau, btau, phind, xsm, \
-                             mu_old, Sigma_old, draws):
             """
-            This version of the sampler increases efficiency by accepting an set of
-            inputs 'Xin' (matrix of data evaluated at basis function combinations)
-            derived from earlier iterations.
+            this version uses the 'Xin' mode of the gibbs sampler
 
+            builds a single-output bss-anova emulator for a stationary dataset in an
+            automated fashion
+
+            function inputs:
             'sigsqd0' is the initial guess for the obs error variance
 
-            'inputs' is the set of normalized inputs -- both parameters and model
-            inputs -- with columns corresponding to inputs and rows the different
-            experimental designs
+            'inputs' is the set of inputs normalized on [0,1]: matrix or numpy array
+            with columns corresponding to inputs and rows the different experimental designs
 
-            'data' are the experimental results: column vector, with entries
-            corresponding to rows of 'inputs'
+            'data' are the output dataset used to build the function: column vector,
+            with entries corresponding to rows of 'inputs'
+
+            'relats' is a boolean matrix indicating which terms should be excluded
+            from the model building; for instance if a certain main effect should be
+            excluded relats will include a row with a 1 in the column for that input
+            and zeros elsewhere; if a certain two way interaction should be excluded
+            there should be a row with ones in those columns and zeros elsewhere
+            to exclude no terms 'relats = np.array([[0]])'. An example of excluding
+            the first input main effect and its interaction with the third input for
+            a case with three total inputs is:'relats = np.array([[1,0,0],[1,0,1]])'
 
             'phis' are a data structure with the spline coefficients for the basis
-            functions, built with 'BasisSpline.txt' and 'splineloader' or
-            'splineconvert'
+            functions, built with 'spline_coefficient.txt' and 'splineconvert' or
+            'spline_coefficient_500.txt' and 'splineconvert500' (the former provides
+            25 basis functions: enough for most things -- while the latter provides
+            500: definitely enough for anything)
 
-            'discmtx' is the interaction matrix for the bss-anova function -- rows
-            are terms in the function and columns are inputs (cols should line up
-            with cols in 'inputs'
-
-            'a' and 'b' are the parameters of the ig distribution for the
-            observation error variance of the data
+            'a' and 'b' are the shape and scale parameters of the ig distribution for
+            the observation error variance of the data. the observation error model is
+            white noise choose the mode of the ig distribution to match the noise in
+            the output dataset and the mean to broaden it some
 
             'atau' and 'btau' are the parameters of the ig distribution for the 'tau
-            squared' parameter: the variance of the beta priors
+            squared' parameter: the variance of the beta priors is iid normal mean
+            zero with variance equal to sigma squared times tau squared. tau squared
+            must be scaled in the prior such that the product of tau squared and sigma
+            squared scales with the output dataset
 
-            'mu_old' and 'Sigma_old' are the means and covariance matrix respectively
-            of the priors of the previous model being updated.
+            'tolerance' controls how hard the function builder tries to find a better
+            model once adding terms starts to show diminishing returns. a good
+            default is 3 -- large datasets could benefit from higher values
 
-            'draws' is the total number of draws
+            'draws' is the total number of draws from the posterior for each tested
+            model
+
+            'draws' is the total number of draws from the posterior for each tested
+
+            'gimmie' is a boolean causing the routine to return the most complex
+            model tried instead of the model with the optimum bic
+
+            'aic' is a boolean specifying the use of the aikaike information
+            criterion
+
+            function outputs:
+
+            'betas' are a draw from the posterior distribution of coefficients: matrix,
+            with rows corresponding to draws and columns corresponding to terms in the
+            GP
+
+            'mtx' is the basis function interaction matrix from the best model:
+            matrix, with rows corresponding to terms in the GP (and thus to the
+            columns of 'betas' and columns corresponding to inputs). A given entry in
+            the matrix gives the order of the basis function appearing in a given term
+            in the GP.
+            All basis functions indicated on a given row are multiplied together.
+            a zero indicates no basis function from a given input is present in a
+            given term.
+
+            'ev' is a vector of BIC values from all the models evaluated
             """
+            phis = self.phis
+            relats_in = self.relats_in
+            a = self.a
+            b = self.b
+            atau = self.atau
+            btau = self.btau
+            tolerance = self.tolerance
+            draws = self.burnin + self.draws  # after fitting, the 'burnin' draws will be discarded from 'betas'
+            gimmie = self.gimmie
+            way3 = self.way3
+            aic = self.aic
+            burn = self.burn # burn draws are disregarded prior to update fitting
+            sigsqd0 = self.sigsqd0
 
-            # building the matrix by calculating the corresponding basis function outputs for each set of inputs
-            minp, ninp = np.shape(inputs)
-            phi_vec = []
-            if np.shape(discmtx) == ():  # part of fix for single input model
-                mmtx = 1
-            else:
-                mmtx, null = np.shape(discmtx)
 
-            if np.size(Xin) == 0:
-                Xin = np.ones((minp, 1))
-                mxin, nxin = np.shape(Xin)
-            else:
-                # X = Xin
-                mxin, nxin = np.shape(Xin)
-            if mmtx - nxin < 0:
-                X = Xin
-            else:
-                X = np.append(Xin, np.zeros((minp, mmtx - nxin)), axis=1)
+            def modelBuilder():
+                if self.built:
+                    model = True
+                    mu_old = np.asmatrix(np.mean(self.betas[self.burn:-1], axis=0))
+                    sigma_old = np.cov(self.betas[self.burn:-1].transpose())
+                else:
+                    model = False
+                    mu_old = []
+                    sigma_old = []
+                return model, mu_old, sigma_old
 
-            for i in range(minp):  # for datapoint in training datapoints
 
-                # ------------------------------
-                # [IN DEVELOPMENT] PRINT PERCENT COMPLETION TO CONSOLE (reported to cause significant delay):
-                #
-                # if self.ConsoleOutput and data.dtype != np.float64:  # if large dataset, show progress for sanity check
-                #     percent = i / (minp - 1)
-                #     sys.stdout.write(f"Gibbs: {round(100 * percent, 2):.2f}%")  # show percent of data looped through
-                #     sys.stdout.write('\r')  # set cursor at beginning of console output line (such that next iteration
-                #         # of Gibbs progress (or [ind, ev] if at end) overwrites current Gibbs progress)
-                #     sys.stdout.flush()
-                #
-                # [END]
-                # ----------------------------
+            def perms(x):
+                """Python equivalent of MATLAB perms."""
+                # from https://stackoverflow.com/questions/38130008/python-equivalent-for-matlabs-perms
+                a = np.vstack(list(itertools.permutations(x)))[::-1]
 
-                for j in range(nxin, mmtx + 1):
-                    null, nxin2 = np.shape(X)
-                    if j == nxin2:
-                        X = np.append(X, np.zeros((minp, 1)), axis=1)
+                return a
 
-                    phi = 1
+            def gibbs_Xin_update(sigsqd0, inputs, data, phis, Xin, discmtx, a, b, atau, btau, phind, xsm, \
+                                 mu_old, Sigma_old, draws):
+                """
+                This version of the sampler increases efficiency by accepting an set of
+                inputs 'Xin' (matrix of data evaluated at basis function combinations)
+                derived from earlier iterations.
 
-                    for k in range(ninp):  # for input var in input vars
+                'sigsqd0' is the initial guess for the obs error variance
 
-                        if np.shape(discmtx) == ():
-                            num = discmtx
+                'inputs' is the set of normalized inputs -- both parameters and model
+                inputs -- with columns corresponding to inputs and rows the different
+                experimental designs
+
+                'data' are the experimental results: column vector, with entries
+                corresponding to rows of 'inputs'
+
+                'phis' are a data structure with the spline coefficients for the basis
+                functions, built with 'BasisSpline.txt' and 'splineloader' or
+                'splineconvert'
+
+                'discmtx' is the interaction matrix for the bss-anova function -- rows
+                are terms in the function and columns are inputs (cols should line up
+                with cols in 'inputs'
+
+                'a' and 'b' are the parameters of the ig distribution for the
+                observation error variance of the data
+
+                'atau' and 'btau' are the parameters of the ig distribution for the 'tau
+                squared' parameter: the variance of the beta priors
+
+                'mu_old' and 'Sigma_old' are the means and covariance matrix respectively
+                of the priors of the previous model being updated.
+
+                'draws' is the total number of draws
+                """
+
+                # building the matrix by calculating the corresponding basis function outputs for each set of inputs
+                minp, ninp = np.shape(inputs)
+                phi_vec = []
+                if np.shape(discmtx) == ():  # part of fix for single input model
+                    mmtx = 1
+                else:
+                    mmtx, null = np.shape(discmtx)
+
+                if np.size(Xin) == 0:
+                    Xin = np.ones((minp, 1))
+                    mxin, nxin = np.shape(Xin)
+                else:
+                    # X = Xin
+                    mxin, nxin = np.shape(Xin)
+                if mmtx - nxin < 0:
+                    X = Xin
+                else:
+                    X = np.append(Xin, np.zeros((minp, mmtx - nxin)), axis=1)
+
+                for i in range(minp):  # for datapoint in training datapoints
+
+                    # ------------------------------
+                    # [IN DEVELOPMENT] PRINT PERCENT COMPLETION TO CONSOLE (reported to cause significant delay):
+                    #
+                    # if self.ConsoleOutput and data.dtype != np.float64:  # if large dataset, show progress for sanity check
+                    #     percent = i / (minp - 1)
+                    #     sys.stdout.write(f"Gibbs: {round(100 * percent, 2):.2f}%")  # show percent of data looped through
+                    #     sys.stdout.write('\r')  # set cursor at beginning of console output line (such that next iteration
+                    #         # of Gibbs progress (or [ind, ev] if at end) overwrites current Gibbs progress)
+                    #     sys.stdout.flush()
+                    #
+                    # [END]
+                    # ----------------------------
+
+                    for j in range(nxin, mmtx + 1):
+                        null, nxin2 = np.shape(X)
+                        if j == nxin2:
+                            X = np.append(X, np.zeros((minp, 1)), axis=1)
+
+                        phi = 1
+
+                        for k in range(ninp):  # for input var in input vars
+
+                            if np.shape(discmtx) == ():
+                                num = discmtx
+                            else:
+                                num = discmtx[j - 1][k]
+
+                            if num != 0:  # enter if loop if num is nonzero
+                                nid = int(num - 1)
+
+                                # Evaluate basis function:
+                                if self.kernel == self.kernels[0]:  # == 'Cubic Splines':
+                                    coeffs = [phis[nid][order][phind[i, k]] for order in range(4)]  # coefficients for cubic
+                                elif self.kernel == self.kernels[1]:  # == 'Bernoulli Polynomials':
+                                    coeffs = phis[nid]  # coefficients for bernoulli
+                                phi = phi * self.evaluate_basis(coeffs, xsm[i, k])  # multiplies phi(x0)*phi(x1)*etc.
+
+                        X[i][j] = phi
+
+                # Once X is evaluated at the new data points, three different conditions are evaluated to
+                # determine the appropriate methodology to pursue.  They are:
+                # 1) No given mean or covariance strong prior (first time model)
+                # 2) Re-evaluate model with strong prior, but same number of terms
+                # 3) Create new terms for model given a strong prior
+
+                # Case 1) New Model
+                if np.size(mu_old) == 0:
+                    # initialize tausqd at the mode of its prior: the inverse of the mode of
+                    # sigma squared, such that the initial variance for the betas is 1
+                    # Start both at the mode of the prior
+
+
+                    tausqd = 1 / sigsqd0
+
+                    XtX = np.transpose(X).dot(X)
+
+                    Xty = np.transpose(X).dot(data)
+
+                    # See the link https://stackoverflow.com/questions/8765310/scipy-linalg-eig-return-complex-eigenvalues-for-covariance-matrix
+                    Lamb, Q = eigh(
+                        XtX)  # using scipy eigh function to avoid generation of imaginary values due to numerical errors
+                    # Lamb, Q = LA.eig(XtX)
+
+                    Lamb_inv = np.diag(1 / Lamb)
+
+                    betahat = Q.dot(Lamb_inv).dot(np.transpose(Q)).dot(Xty)
+                    # This is sum squared error, not just squared error or L2 Norm
+                    squerr = LA.norm(data - X.dot(betahat)) ** 2
+
+                    astar = a + 1 + len(data) / 2 + (mmtx + 1) / 2
+                    atau_star = atau + mmtx / 2
+
+                    dtd = np.transpose(data).dot(data)
+
+                    # Gibbs iterations
+
+                    betas = np.zeros((draws, mmtx + 1))
+                    sigs = np.zeros((draws, 1))
+                    taus = np.zeros((draws, 1))
+                    sigsqd = sigsqd0
+
+                    lik = np.zeros((draws, 1))
+                    n = len(data)
+
+                    for k in range(draws):
+                        # Step 1: Hold sigma squared and tau squared constant
+                        # This is to get the inverse of the new covariance
+                        Lamb_tausqd = np.diag(Lamb) + (1 / tausqd) * np.identity(mmtx + 1)
+                        Lamb_tausqd_inv = np.diag(1 / np.diag(Lamb_tausqd))
+
+                        # What does mun (mu new)
+                        mun = Q.dot(Lamb_tausqd_inv).dot(np.transpose(Q)).dot(Xty)
+                        S = Q.dot(np.diag(np.diag(Lamb_tausqd_inv) ** (1 / 2)))
+
+                        vec = np.random.normal(loc=0, scale=1, size=(mmtx + 1, 1))  # drawing from normal distribution
+                        betas[k][:] = np.transpose(mun + sigsqd ** (1 / 2) * (S).dot(vec))
+
+                        # Components for the likelihood
+                        comp1 = -(n / 2) * np.log(sigsqd)
+                        comp2 = np.transpose(betahat) - betas[k][:]
+                        comp3 = betahat - np.reshape(betas[k][:], (len(betas[k][:]), 1))
+                        # forcing array into a column for comp3, np.transpose not effective
+                        lik[k] = comp1 - (squerr + comp2.dot(XtX).dot(comp3)) / (2 * sigsqd)
+
+                        # vecc is difference between mu new and betas calculated
+                        vecc = mun - np.reshape(betas[k][:], (len(betas[k][:]), 1))
+
+                        # Step 2: Hold Beta and tau squared constant, calculate sigma squared
+                        comp1 = 0.5 * np.transpose(vecc)
+                        comp2 = (XtX + (1 / tausqd) * np.identity(mmtx + 1)).dot(vecc)
+                        comp3 = 0.5 * np.transpose(mun).dot(Xty)
+
+                        bstar = b + comp1.dot(comp2) + 0.5 * dtd - comp3;
+
+                        # Returning a 'not a number' constant if bstar is negative, which would
+                        # cause np.random.gamma to return a ValueError
+                        if bstar < 0:
+                            sigsqd = math.nan
                         else:
-                            num = discmtx[j - 1][k]
+                            sigsqd = 1 / np.random.gamma(astar, 1 / bstar)
 
-                        if num != 0:  # enter if loop if num is nonzero
-                            nid = int(num - 1)
+                        sigs[k] = sigsqd
 
-                            # Evaluate basis function:
-                            if self.kernel == self.kernels[0]:  # == 'Cubic Splines':
-                                coeffs = [phis[nid][order][phind[i, k]] for order in range(4)]  # coefficients for cubic
-                            elif self.kernel == self.kernels[1]:  # == 'Bernoulli Polynomials':
-                                coeffs = phis[nid]  # coefficients for bernoulli
-                            phi = phi * self.evaluate_basis(coeffs, xsm[i, k])  # multiplies phi(x0)*phi(x1)*etc.
+                        # Step 3: Hold Beta and sigma squared constant, calculate tau squared
+                        btau_star = (1 / (2 * sigsqd)) * (
+                            betas[k][:].dot(np.reshape(betas[k][:], (len(betas[k][:]), 1)))) + btau
 
-                    X[i][j] = phi
+                        tausqd = 1 / np.random.gamma(atau_star, 1 / btau_star)
+                        taus[k] = tausqd
 
-            # Once X is evaluated at the new data points, three different conditions are evaluated to
-            # determine the appropriate methodology to pursue.  They are:
-            # 1) No given mean or covariance strong prior (first time model)
-            # 2) Re-evaluate model with strong prior, but same number of terms
-            # 3) Create new terms for model given a strong prior
+                    # Calculate the evidence (BIC)
+                    ev = (mmtx + 1) * np.log(n) - 2 * max(lik)
 
-            # Case 1) New Model
-            if np.size(mu_old) == 0:
-                # initialize tausqd at the mode of its prior: the inverse of the mode of
-                # sigma squared, such that the initial variance for the betas is 1
-                # Start both at the mode of the prior
+                    X = X[:, 0:mmtx]
 
+                    return betas, sigs, taus, X, ev
 
-                tausqd = 1 / sigsqd0
+                # Case 2) Given Strong Prior (Old Model), no new terms
+                elif np.shape(mu_old)[1] == mmtx + 1:
+                    print('same')
+                    # seperate into a section with X_old and X_new based on the existing
+                    # parameters noted in Xin
 
-                XtX = np.transpose(X).dot(X)
+                    null, num_old_terms = np.shape(mu_old)
 
-                Xty = np.transpose(X).dot(data)
+                    length_old = num_old_terms
 
-                # See the link https://stackoverflow.com/questions/8765310/scipy-linalg-eig-return-complex-eigenvalues-for-covariance-matrix
-                Lamb, Q = eigh(
-                    XtX)  # using scipy eigh function to avoid generation of imaginary values due to numerical errors
-                # Lamb, Q = LA.eig(XtX)
+                    X_old = X
 
-                Lamb_inv = np.diag(1 / Lamb)
+                    # initialize tausqd at the mode of its prior: the inverse of the mode of
+                    # sigma squared, such that the initial variance for the betas is 1
+                    # Start both at the mode of the prior
+                    tausqd = 1 / sigsqd0
 
-                betahat = Q.dot(Lamb_inv).dot(np.transpose(Q)).dot(Xty)
-                # This is sum squared error, not just squared error or L2 Norm
-                squerr = LA.norm(data - X.dot(betahat)) ** 2
+                    # Precompute Terms related to 'old' values
+                    XotXo = np.asmatrix(np.transpose(X_old).dot(X_old))
 
-                astar = a + 1 + len(data) / 2 + (mmtx + 1) / 2
-                atau_star = atau + mmtx / 2
+                    Xoty = np.transpose(X_old).dot(data)
 
-                dtd = np.transpose(data).dot(data)
+                    Sigma_old_inverse = np.linalg.inv(Sigma_old)
 
-                # Gibbs iterations
+                    # Precompute terms for sigma squared and tau squared
+                    astar = a + len(data) / 2 + (mmtx + 1) / 2
+                    atau_star = atau + (mmtx + 1) / 2
 
-                betas = np.zeros((draws, mmtx + 1))
-                sigs = np.zeros((draws, 1))
-                taus = np.zeros((draws, 1))
-                sigsqd = sigsqd0
+                    yty = np.transpose(data).dot(data)
+                    ytXo = np.transpose(data).dot(X_old)
 
-                lik = np.zeros((draws, 1))
-                n = len(data)
+                    # Gibbs iterations
 
-                for k in range(draws):
-                    # Step 1: Hold sigma squared and tau squared constant
-                    # This is to get the inverse of the new covariance
-                    Lamb_tausqd = np.diag(Lamb) + (1 / tausqd) * np.identity(mmtx + 1)
-                    Lamb_tausqd_inv = np.diag(1 / np.diag(Lamb_tausqd))
+                    betas_old = np.asmatrix(np.zeros((draws, num_old_terms)))
+                    sigs = np.zeros((draws, 1))
+                    taus = np.zeros((draws, 1))
+                    sigsqd = sigsqd0
 
-                    # What does mun (mu new)
-                    mun = Q.dot(Lamb_tausqd_inv).dot(np.transpose(Q)).dot(Xty)
-                    S = Q.dot(np.diag(np.diag(Lamb_tausqd_inv) ** (1 / 2)))
+                    lik = np.zeros((draws, 1))
+                    n = len(data)
 
-                    vec = np.random.normal(loc=0, scale=1, size=(mmtx + 1, 1))  # drawing from normal distribution
-                    betas[k][:] = np.transpose(mun + sigsqd ** (1 / 2) * (S).dot(vec))
+                    mu_old = mu_old.transpose()
 
-                    # Components for the likelihood
-                    comp1 = -(n / 2) * np.log(sigsqd)
-                    comp2 = np.transpose(betahat) - betas[k][:]
-                    comp3 = betahat - np.reshape(betas[k][:], (len(betas[k][:]), 1))
-                    # forcing array into a column for comp3, np.transpose not effective
-                    lik[k] = comp1 - (squerr + comp2.dot(XtX).dot(comp3)) / (2 * sigsqd)
+                    for k in range(draws):
+                        # Step 1: Hold betas_new, sigma squared, and tau squared constant. Get betas_old
+                        Sigma_old_inverse_post = XotXo + (1 / tausqd) * Sigma_old_inverse
+                        Sigma_old_post = np.linalg.inv(Sigma_old_inverse_post)
 
-                    # vecc is difference between mu new and betas calculated
-                    vecc = mun - np.reshape(betas[k][:], (len(betas[k][:]), 1))
+                        # See the link https://stackoverflow.com/questions/8765310/scipy-linalg-eig-return-complex-eigenvalues-for-covariance-matrix
+                        Lamb_old, Q_old = eigh(XotXo + (
+                                    1 / tausqd) * Sigma_old_inverse)  # using scipy eigh function to avoid generation of imaginary values due to numerical errors
+                        # Lamb_tausqd_inv_old = np.diag(np.linalg.inv((np.diag(Lamb_old))))
+                        Lamb_tausqd_inv_old = 1/Lamb_old
 
-                    # Step 2: Hold Beta and tau squared constant, calculate sigma squared
-                    comp1 = 0.5 * np.transpose(vecc)
-                    comp2 = (XtX + (1 / tausqd) * np.identity(mmtx + 1)).dot(vecc)
-                    comp3 = 0.5 * np.transpose(mun).dot(Xty)
+                        # Mean of distribution
+                        mu_old_first_part = (Xoty + (1 / tausqd * Sigma_old_inverse).dot(mu_old))
+                        mu_old_post = Sigma_old_post.dot(mu_old_first_part)
+                        # print('Sigma_old_inverse.dot(mu_old)', Sigma_old_inverse.dot(mu_old))
+                        S_old = Q_old.dot((np.diag(Lamb_tausqd_inv_old) ** (1 / 2)))
 
-                    bstar = b + comp1.dot(comp2) + 0.5 * dtd - comp3;
+                        # Random draw for sampling
+                        vec_old = np.random.normal(loc=0, scale=1, size=(length_old, 1))  # drawing from normal distribution
+                        betas_old[k][:] = np.transpose(mu_old_post + sigsqd ** (1 / 2) * (S_old).dot(vec_old))
 
-                    # Returning a 'not a number' constant if bstar is negative, which would
-                    # cause np.random.gamma to return a ValueError
-                    if bstar < 0:
-                        sigsqd = math.nan
-                    else:
-                        sigsqd = 1 / np.random.gamma(astar, 1 / bstar)
+                        # Step 2: Hold betas_old, betas_new, and tau squared constant, calculate sigma squared
+                        comp1 = 0.5 * (yty - ytXo.dot(betas_old[k][:].transpose()))
+                        comp2 = 0.5 * (-(betas_old[k][:]).dot(Xoty) + (betas_old[k][:]).dot(XotXo).dot(
+                            betas_old[k][:].transpose()))
+                        comp3 = 0.5 * (1 / tausqd) * (
+                                    (betas_old[k][:]).dot(Sigma_old_inverse).dot(betas_old[k][:].transpose()) - (
+                            betas_old[k][:]).dot(Sigma_old_inverse).dot(mu_old))
+                        comp4 = 0.5 * (1 / tausqd) * (-np.transpose(mu_old).dot(Sigma_old_inverse).dot(
+                            betas_old[k][:].transpose()) + np.transpose(mu_old).dot(Sigma_old_inverse).dot(mu_old))
 
-                    sigs[k] = sigsqd
+                        bstar = comp1 + comp2 + comp3 + comp4 + b
+                        # Returning a 'not a number' constant if bstar is negative, which would
+                        # cause np.random.gamma to return a ValueError
+                        if bstar < 0:
+                            sigsqd = math.nan
+                        else:
+                            sigsqd = 1 / np.random.gamma(astar, 1 / bstar)
 
-                    # Step 3: Hold Beta and sigma squared constant, calculate tau squared
-                    btau_star = (1 / (2 * sigsqd)) * (
-                        betas[k][:].dot(np.reshape(betas[k][:], (len(betas[k][:]), 1)))) + btau
+                        sigs[k] = sigsqd
 
-                    tausqd = 1 / np.random.gamma(atau_star, 1 / btau_star)
-                    taus[k] = tausqd
+                        # Step 3: Hold betas_old, betas_new, and sigma squared constant, calculate tau squared
+                        comp1 = 0.5 * (1 / sigsqd) * (
+                                    (betas_old[k][:]).dot(Sigma_old_inverse).dot(betas_old[k][:].transpose()) - (
+                            betas_old[k][:]).dot(Sigma_old_inverse).dot(mu_old))
+                        comp2 = 0.5 * (1 / sigsqd) * (-np.transpose(mu_old).dot(Sigma_old_inverse).dot(
+                            betas_old[k][:].transpose()) + np.transpose(mu_old).dot(Sigma_old_inverse).dot(mu_old))
 
-                # Calculate the evidence (BIC)
-                ev = (mmtx + 1) * np.log(n) - 2 * max(lik)
+                        btau_star = comp1 + comp2 + btau
 
-                X = X[:, 0:mmtx]
+                        tausqd = 1 / np.random.gamma(atau_star, 1 / btau_star)
+                        taus[k] = tausqd
 
-                return betas, sigs, taus, X, ev
+                        # Step 5: for BIC, calculate the Natural Log Likelihood
+                        comp1 = -(n / 2) * np.log(sigsqd)
+                        comp2 = yty - ytXo.dot(betas_old[k][:].transpose())
+                        comp3 = -(betas_old[k][:]).dot(Xoty) + (betas_old[k][:]).dot(XotXo).dot(betas_old[k][:].transpose())
 
-            # Case 2) Given Strong Prior (Old Model), no new terms
-            elif np.shape(mu_old)[1] == mmtx + 1:
-                print('same')
-                # seperate into a section with X_old and X_new based on the existing
-                # parameters noted in Xin
+                        lik[k] = comp1 - 0.5 / sigsqd * (comp2 + comp3)
 
-                null, num_old_terms = np.shape(mu_old)
+                    # Calculate the evidence (BIC)
+                    ev = (mmtx + 1) * np.log(n) - 2 * max(lik)
 
-                length_old = num_old_terms
+                    # Updated X matrix, not differentiated between old and new though
+                    X = X[:, 0:mmtx]
 
-                X_old = X
+                    betas = betas_old
 
-                # initialize tausqd at the mode of its prior: the inverse of the mode of
-                # sigma squared, such that the initial variance for the betas is 1
-                # Start both at the mode of the prior
-                tausqd = 1 / sigsqd0
+                    return betas, sigs, taus, X, ev
 
-                # Precompute Terms related to 'old' values
-                XotXo = np.asmatrix(np.transpose(X_old).dot(X_old))
+                # Case 3) Give Strong Prior (Old Model), creating new terms
+                elif np.shape(mu_old)[1] < mmtx + 1:
+                    print('new')
+                    # seperate into a section with X_old and X_new based on the existing
+                    # parameters noted in Xin
 
-                Xoty = np.transpose(X_old).dot(data)
+                    null, num_old_terms = np.shape(mu_old)
 
-                Sigma_old_inverse = np.linalg.inv(Sigma_old)
+                    length_old = num_old_terms
+                    length_new = mmtx - num_old_terms + 1
 
-                # Precompute terms for sigma squared and tau squared
-                astar = a + len(data) / 2 + (mmtx + 1) / 2
-                atau_star = atau + (mmtx + 1) / 2
+                    X_old = X[:, 0:length_old]
+                    X_new = X[:, length_old: length_old + length_new]
 
-                yty = np.transpose(data).dot(data)
-                ytXo = np.transpose(data).dot(X_old)
+                    # initialize tausqd at the mode of its prior: the inverse of the mode of
+                    # sigma squared, such that the initial variance for the betas is 1
+                    # Start both at the mode of the prior
+                    tausqd = 1 / sigsqd0
 
-                # Gibbs iterations
+                    # Precompute Terms related to 'old' values
+                    XotXo = np.asmatrix(np.transpose(X_old).dot(X_old))
 
-                betas_old = np.asmatrix(np.zeros((draws, num_old_terms)))
-                sigs = np.zeros((draws, 1))
-                taus = np.zeros((draws, 1))
-                sigsqd = sigsqd0
+                    Xoty = np.transpose(X_old).dot(data)
 
-                lik = np.zeros((draws, 1))
-                n = len(data)
-
-                mu_old = mu_old.transpose()
-
-                for k in range(draws):
-                    # Step 1: Hold betas_new, sigma squared, and tau squared constant. Get betas_old
-                    Sigma_old_inverse_post = XotXo + (1 / tausqd) * Sigma_old_inverse
+                    Sigma_old_inverse = np.linalg.inv(Sigma_old)
+                    Sigma_old_inverse_post = XotXo + Sigma_old_inverse
                     Sigma_old_post = np.linalg.inv(Sigma_old_inverse_post)
 
                     # See the link https://stackoverflow.com/questions/8765310/scipy-linalg-eig-return-complex-eigenvalues-for-covariance-matrix
-                    Lamb_old, Q_old = eigh(XotXo + (
-                                1 / tausqd) * Sigma_old_inverse)  # using scipy eigh function to avoid generation of imaginary values due to numerical errors
-                    # Lamb_tausqd_inv_old = np.diag(np.linalg.inv((np.diag(Lamb_old))))
-                    Lamb_tausqd_inv_old = 1/Lamb_old
+                    Lamb_old, Q_old = eigh(
+                        XotXo + Sigma_old_inverse)  # using scipy eigh function to avoid generation of imaginary values due to numerical errors
+                    # Lamb, Q = LA.eig(XtX)
 
-                    # Mean of distribution
-                    mu_old_first_part = (Xoty + (1 / tausqd * Sigma_old_inverse).dot(mu_old))
-                    mu_old_post = Sigma_old_post.dot(mu_old_first_part)
-                    # print('Sigma_old_inverse.dot(mu_old)', Sigma_old_inverse.dot(mu_old))
-                    S_old = Q_old.dot((np.diag(Lamb_tausqd_inv_old) ** (1 / 2)))
+                    # Lamb_old_inv = np.diag(1/Lamb_old)
 
-                    # Random draw for sampling
-                    vec_old = np.random.normal(loc=0, scale=1, size=(length_old, 1))  # drawing from normal distribution
-                    betas_old[k][:] = np.transpose(mu_old_post + sigsqd ** (1 / 2) * (S_old).dot(vec_old))
+                    # betahat_old = Q_old.dot(Lamb_old_inv).dot(np.transpose(Q_old)).dot(Xoty)
+                    # This is sum squared error, not just squared error or L2 Norm
+                    # squerr_old = LA.norm(data - X_old.dot(betahat_old)) ** 2
 
-                    # Step 2: Hold betas_old, betas_new, and tau squared constant, calculate sigma squared
-                    comp1 = 0.5 * (yty - ytXo.dot(betas_old[k][:].transpose()))
-                    comp2 = 0.5 * (-(betas_old[k][:]).dot(Xoty) + (betas_old[k][:]).dot(XotXo).dot(
-                        betas_old[k][:].transpose()))
-                    comp3 = 0.5 * (1 / tausqd) * (
-                                (betas_old[k][:]).dot(Sigma_old_inverse).dot(betas_old[k][:].transpose()) - (
+                    # Precompute Terms related to 'new' values
+                    XntXn = np.transpose(X_new).dot(X_new)
+
+                    Xnty = np.transpose(X_new).dot(data)
+
+                    # See the link https://stackoverflow.com/questions/8765310/scipy-linalg-eig-return-complex-eigenvalues-for-covariance-matrix
+                    Lamb_new, Q_new = eigh(
+                        XntXn)  # using scipy eigh function to avoid generation of imaginary values due to numerical errors
+                    # Lamb, Q = LA.eig(XtX)
+
+                    # Lamb_new_inv = np.diag(np.linalg.inv(Lamb_new))
+
+                    # betahat_new = Q_new.dot(Lamb_new_inv).dot(np.transpose(Q_new)).dot(Xnty)
+                    # This is sum squared error, not just squared error or L2 Norm
+                    # squerr_new = LA.norm(data - X_new.dot(betahat_new)) ** 2
+
+                    XotXn = np.transpose(X_old).dot(X_new)
+                    XntXo = np.transpose(X_new).dot(X_old)
+
+                    # Sigma_old_inverse = np.linalg.inv(Sigma_old)
+                    # Sigma_old_inverse_post = XotXo+Sigma_old_inverse
+                    # Sigma_old_post = np.linalg.inv(Sigma_old_inverse_post)
+                    # print('Sigma Old Post', Sigma_old_post)
+
+                    # Lamb_tausqd_old = np.diag(Lamb_old) + Sigma_old
+                    Lamb_tausqd_inv_old = np.diag(np.linalg.inv((np.diag(Lamb_old))))
+                    # print('Lamb_tausqd_old', np.shape(Lamb_tausqd_old))
+                    # print('Lamb_tausqd_inv_old', np.shape(Lamb_tausqd_inv_old))
+                    # print('Q_old', np.shape(Q_old))
+
+                    # Precompute terms for sigma squared and tau squared
+                    astar = a + len(data) / 2 + (mmtx + 1) / 2
+                    atau_star = atau + (length_new) / 2
+
+                    yty = np.transpose(data).dot(data)
+                    ytXo = np.transpose(data).dot(X_old)
+                    ytXn = np.transpose(data).dot(X_new)
+
+                    # Gibbs iterations
+
+                    betas_old = np.asmatrix(np.zeros((draws, num_old_terms)))
+                    betas_new = np.asmatrix(np.zeros((draws, mmtx - num_old_terms + 1)))
+                    sigs = np.zeros((draws, 1))
+                    taus = np.zeros((draws, 1))
+                    sigsqd = sigsqd0
+
+                    lik = np.zeros((draws, 1))
+                    n = len(data)
+
+                    mu_old = mu_old.transpose()
+
+                    for k in range(draws):
+                        # Step 1: Hold betas_new, sigma squared, and tau squared constant. Get betas_old
+
+                        # Mean of distribution
+                        mu_old_first_part = Xoty - XotXn.dot(betas_new[k - 1].transpose()) + Sigma_old_inverse.dot(mu_old)
+                        mu_old_post = Sigma_old_post.dot(mu_old_first_part)
+                        S_old = Q_old.dot((np.diag(Lamb_tausqd_inv_old) ** (1 / 2)))
+
+                        vec_old = np.random.normal(loc=0, scale=1, size=(length_old, 1))  # drawing from normal distribution
+                        betas_old[k][:] = np.transpose(mu_old_post + sigsqd ** (1 / 2) * (S_old).dot(vec_old))
+
+                        # Step 2: Hold betas_new, sigma squared, and tau squared constant. Get betas_old
+                        # This is to get the inverse of the new covariance
+                        Lamb_tausqd_new = np.diag(Lamb_new) + (1 / tausqd) * np.identity(length_new)
+                        Lamb_tausqd_inv_new = np.diag(np.linalg.inv(Lamb_tausqd_new))
+
+                        # Mean of distribution
+                        mu_new_first_part = Xnty - XntXo.dot(betas_old[k].transpose())
+                        Sigma_new_inverse_post = XntXn + (1 / tausqd) * np.identity(length_new)
+                        mu_new_post = (np.linalg.inv(Sigma_new_inverse_post)).dot(mu_new_first_part)
+                        S_new = Q_new.dot((np.diag(Lamb_tausqd_inv_new) ** (1 / 2)))
+
+                        vec_new = np.random.normal(loc=0, scale=1, size=(length_new, 1))  # drawing from normal distribution
+                        betas_new[k][:] = np.transpose(mu_new_post + sigsqd ** (1 / 2) * (S_new).dot(vec_new))
+
+                        # Step 3: Hold betas_old, betas_new, and tau squared constant, calculate sigma squared
+                        comp1 = 0.5 * (yty - ytXo.dot(betas_old[k][:].transpose()) - ytXn.dot(betas_new[k][:].transpose()))
+                        comp2 = 0.5 * (-(betas_old[k][:]).dot(Xoty) + (betas_old[k][:]).dot(XotXo).dot(
+                            betas_old[k][:].transpose()) + (betas_old[k][:]).dot(XotXn).dot(betas_new[k][:].transpose()))
+                        comp3 = 0.5 * (-(betas_new[k][:]).dot(Xnty) + (betas_new[k][:]).dot(XntXo).dot(
+                            betas_old[k][:].transpose()) + (betas_new[k][:]).dot(XntXn).dot(betas_new[k][:].transpose()))
+                        comp4 = 0.5 / tausqd * ((betas_new[k][:]).dot(betas_new[k][:].transpose()))
+                        comp5 = 0.5 * ((betas_old[k][:]).dot(Sigma_old_inverse).dot(betas_old[k][:].transpose()) - (
                         betas_old[k][:]).dot(Sigma_old_inverse).dot(mu_old))
-                    comp4 = 0.5 * (1 / tausqd) * (-np.transpose(mu_old).dot(Sigma_old_inverse).dot(
-                        betas_old[k][:].transpose()) + np.transpose(mu_old).dot(Sigma_old_inverse).dot(mu_old))
+                        comp6 = 0.5 * (-np.transpose(mu_old).dot(Sigma_old_inverse).dot(
+                            betas_old[k][:].transpose()) + np.transpose(mu_old).dot(Sigma_old_inverse).dot(mu_old))
 
-                    bstar = comp1 + comp2 + comp3 + comp4 + b
-                    # Returning a 'not a number' constant if bstar is negative, which would
-                    # cause np.random.gamma to return a ValueError
-                    if bstar < 0:
-                        sigsqd = math.nan
-                    else:
-                        sigsqd = 1 / np.random.gamma(astar, 1 / bstar)
+                        bstar = comp1 + comp2 + comp3 + comp4 + comp5 + comp6 + b
+                        # Returning a 'not a number' constant if bstar is negative, which would
+                        # cause np.random.gamma to return a ValueError
+                        if bstar < 0:
+                            sigsqd = math.nan
+                        else:
+                            sigsqd = 1 / np.random.gamma(astar, 1 / bstar)
 
-                    sigs[k] = sigsqd
+                        sigs[k] = sigsqd
 
-                    # Step 3: Hold betas_old, betas_new, and sigma squared constant, calculate tau squared
-                    comp1 = 0.5 * (1 / sigsqd) * (
-                                (betas_old[k][:]).dot(Sigma_old_inverse).dot(betas_old[k][:].transpose()) - (
-                        betas_old[k][:]).dot(Sigma_old_inverse).dot(mu_old))
-                    comp2 = 0.5 * (1 / sigsqd) * (-np.transpose(mu_old).dot(Sigma_old_inverse).dot(
-                        betas_old[k][:].transpose()) + np.transpose(mu_old).dot(Sigma_old_inverse).dot(mu_old))
+                        # Step 4: Hold betas_old, betas_new, and sigma squared constant, calculate tau squared
+                        btau_star = (1 / (2 * sigsqd)) * (betas_new[k][:].dot(betas_new[k][:].transpose())) + btau
 
-                    btau_star = comp1 + comp2 + btau
+                        tausqd = 1 / np.random.gamma(atau_star, 1 / btau_star)
+                        taus[k] = tausqd
 
-                    tausqd = 1 / np.random.gamma(atau_star, 1 / btau_star)
-                    taus[k] = tausqd
+                        # Step 5: for BIC, calculate the Natural Log Likelihood
+                        comp1 = -(n / 2) * np.log(sigsqd)
+                        comp2 = yty - ytXo.dot(betas_old[k][:].transpose()) - ytXn.dot(betas_new[k][:].transpose())
+                        comp3 = -(betas_old[k][:]).dot(Xoty) + (betas_old[k][:]).dot(XotXo).dot(
+                            betas_old[k][:].transpose()) + (betas_old[k][:]).dot(XotXn).dot(betas_new[k][:].transpose())
+                        comp4 = -(betas_new[k][:]).dot(Xnty) + (betas_new[k][:]).dot(XntXo).dot(
+                            betas_old[k][:].transpose()) + (betas_new[k][:]).dot(XntXn).dot(betas_new[k][:].transpose())
 
-                    # Step 5: for BIC, calculate the Natural Log Likelihood
-                    comp1 = -(n / 2) * np.log(sigsqd)
-                    comp2 = yty - ytXo.dot(betas_old[k][:].transpose())
-                    comp3 = -(betas_old[k][:]).dot(Xoty) + (betas_old[k][:]).dot(XotXo).dot(betas_old[k][:].transpose())
+                        lik[k] = comp1 - 0.5 / sigsqd * (comp2 + comp3 + comp4)
 
-                    lik[k] = comp1 - 0.5 / sigsqd * (comp2 + comp3)
+                    # Calculate the evidence (BIC)
+                    ev = (mmtx + 1) * np.log(n) - 2 * max(lik)
 
-                # Calculate the evidence (BIC)
-                ev = (mmtx + 1) * np.log(n) - 2 * max(lik)
+                    # Updated X matrix, not differentiated between old and new though
+                    X = X[:, 0:mmtx]
 
-                # Updated X matrix, not differentiated between old and new though
-                X = X[:, 0:mmtx]
+                    betas = np.concatenate((betas_old, betas_new), axis=1)
 
-                betas = betas_old
+                    return betas, sigs, taus, X, ev
 
-                return betas, sigs, taus, X, ev
 
-            # Case 3) Give Strong Prior (Old Model), creating new terms
-            elif np.shape(mu_old)[1] < mmtx + 1:
-                print('new')
-                # seperate into a section with X_old and X_new based on the existing
-                # parameters noted in Xin
+                # Case 4) Something unexpected happens
+                else:
+                    print('Error: No appropriate cases for evaluation found.')
+                    return
 
+            # Check if initial model of updated
+            [model, mu_old, sigma_old] = modelBuilder()
+
+            # Prepare phind and xsm if using cubic splines, else match variable names required for gibbs argument
+            if self.kernel == self.kernels[0]:  # == 'Cubic Splines':
+                _, phind, xsm = self._inputs_to_phind(inputs)  # ..., phis=self.phis, kernel=self.kernel) already true
+            elif self.kernel == self.kernels[1]:  # == 'Bernoulli Polynomials':
+                phind = None
+                xsm = inputs
+
+
+            # 'n' is the number of datapoints whereas 'm' is the number of inputs
+            n, m = np.shape(inputs)
+            mrel = n
+            damtx = []
+            evs = []
+
+            # Conversion of Lines 79-100 of emulator_Xin.m
+            if np.logical_not(
+                    all([isinstance(index, int) for index in relats_in])):  # checks relats to see if it's an array
+                if sum(np.logical_not(relats_in)).all():
+                    relats = np.zeros((sum(np.logical_not(relats_in)), m))
+                    ind = 1
+                    for i in range(0, m):
+                        if np.logical_not(relats_in[i]):
+                            relats[ind][i] = 1
+                            ind = ind + 1
+                    ind_in = m + 1
+                    for i in range(0, m - 1):
+                        for j in range(i + 1, m):
+                            if np.logical_not(relats_in[ind_in]):
+                                relats[ind][i] = 1
+                                relats[ind][j] = 1
+                                ind = ind + 1
+                        ind_in = ind_in + 1
+                mrel = sum(np.logical_not(relats_in)).all()
+            else:
+                mrel = sum(np.logical_not(relats_in))
+
+            # Define the number of terms the interaction matrix needs
+            if np.size(mu_old) == 0:
+                num_old_terms = 0
+            else:
                 null, num_old_terms = np.shape(mu_old)
 
-                length_old = num_old_terms
-                length_new = mmtx - num_old_terms + 1
+            # End conversion
 
-                X_old = X[:, 0:length_old]
-                X_new = X[:, length_old: length_old + length_new]
+            # 'ind' is an integer which controls the development of new terms
+            ind = 1
+            greater = 0
+            finished = 0
+            X = []
 
-                # initialize tausqd at the mode of its prior: the inverse of the mode of
-                # sigma squared, such that the initial variance for the betas is 1
-                # Start both at the mode of the prior
-                tausqd = 1 / sigsqd0
-
-                # Precompute Terms related to 'old' values
-                XotXo = np.asmatrix(np.transpose(X_old).dot(X_old))
-
-                Xoty = np.transpose(X_old).dot(data)
-
-                Sigma_old_inverse = np.linalg.inv(Sigma_old)
-                Sigma_old_inverse_post = XotXo + Sigma_old_inverse
-                Sigma_old_post = np.linalg.inv(Sigma_old_inverse_post)
-
-                # See the link https://stackoverflow.com/questions/8765310/scipy-linalg-eig-return-complex-eigenvalues-for-covariance-matrix
-                Lamb_old, Q_old = eigh(
-                    XotXo + Sigma_old_inverse)  # using scipy eigh function to avoid generation of imaginary values due to numerical errors
-                # Lamb, Q = LA.eig(XtX)
-
-                # Lamb_old_inv = np.diag(1/Lamb_old)
-
-                # betahat_old = Q_old.dot(Lamb_old_inv).dot(np.transpose(Q_old)).dot(Xoty)
-                # This is sum squared error, not just squared error or L2 Norm
-                # squerr_old = LA.norm(data - X_old.dot(betahat_old)) ** 2
-
-                # Precompute Terms related to 'new' values
-                XntXn = np.transpose(X_new).dot(X_new)
-
-                Xnty = np.transpose(X_new).dot(data)
-
-                # See the link https://stackoverflow.com/questions/8765310/scipy-linalg-eig-return-complex-eigenvalues-for-covariance-matrix
-                Lamb_new, Q_new = eigh(
-                    XntXn)  # using scipy eigh function to avoid generation of imaginary values due to numerical errors
-                # Lamb, Q = LA.eig(XtX)
-
-                # Lamb_new_inv = np.diag(np.linalg.inv(Lamb_new))
-
-                # betahat_new = Q_new.dot(Lamb_new_inv).dot(np.transpose(Q_new)).dot(Xnty)
-                # This is sum squared error, not just squared error or L2 Norm
-                # squerr_new = LA.norm(data - X_new.dot(betahat_new)) ** 2
-
-                XotXn = np.transpose(X_old).dot(X_new)
-                XntXo = np.transpose(X_new).dot(X_old)
-
-                # Sigma_old_inverse = np.linalg.inv(Sigma_old)
-                # Sigma_old_inverse_post = XotXo+Sigma_old_inverse
-                # Sigma_old_post = np.linalg.inv(Sigma_old_inverse_post)
-                # print('Sigma Old Post', Sigma_old_post)
-
-                # Lamb_tausqd_old = np.diag(Lamb_old) + Sigma_old
-                Lamb_tausqd_inv_old = np.diag(np.linalg.inv((np.diag(Lamb_old))))
-                # print('Lamb_tausqd_old', np.shape(Lamb_tausqd_old))
-                # print('Lamb_tausqd_inv_old', np.shape(Lamb_tausqd_inv_old))
-                # print('Q_old', np.shape(Q_old))
-
-                # Precompute terms for sigma squared and tau squared
-                astar = a + len(data) / 2 + (mmtx + 1) / 2
-                atau_star = atau + (length_new) / 2
-
-                yty = np.transpose(data).dot(data)
-                ytXo = np.transpose(data).dot(X_old)
-                ytXn = np.transpose(data).dot(X_new)
-
-                # Gibbs iterations
-
-                betas_old = np.asmatrix(np.zeros((draws, num_old_terms)))
-                betas_new = np.asmatrix(np.zeros((draws, mmtx - num_old_terms + 1)))
-                sigs = np.zeros((draws, 1))
-                taus = np.zeros((draws, 1))
-                sigsqd = sigsqd0
-
-                lik = np.zeros((draws, 1))
-                n = len(data)
-
-                mu_old = mu_old.transpose()
-
-                for k in range(draws):
-                    # Step 1: Hold betas_new, sigma squared, and tau squared constant. Get betas_old
-
-                    # Mean of distribution
-                    mu_old_first_part = Xoty - XotXn.dot(betas_new[k - 1].transpose()) + Sigma_old_inverse.dot(mu_old)
-                    mu_old_post = Sigma_old_post.dot(mu_old_first_part)
-                    S_old = Q_old.dot((np.diag(Lamb_tausqd_inv_old) ** (1 / 2)))
-
-                    vec_old = np.random.normal(loc=0, scale=1, size=(length_old, 1))  # drawing from normal distribution
-                    betas_old[k][:] = np.transpose(mu_old_post + sigsqd ** (1 / 2) * (S_old).dot(vec_old))
-
-                    # Step 2: Hold betas_new, sigma squared, and tau squared constant. Get betas_old
-                    # This is to get the inverse of the new covariance
-                    Lamb_tausqd_new = np.diag(Lamb_new) + (1 / tausqd) * np.identity(length_new)
-                    Lamb_tausqd_inv_new = np.diag(np.linalg.inv(Lamb_tausqd_new))
-
-                    # Mean of distribution
-                    mu_new_first_part = Xnty - XntXo.dot(betas_old[k].transpose())
-                    Sigma_new_inverse_post = XntXn + (1 / tausqd) * np.identity(length_new)
-                    mu_new_post = (np.linalg.inv(Sigma_new_inverse_post)).dot(mu_new_first_part)
-                    S_new = Q_new.dot((np.diag(Lamb_tausqd_inv_new) ** (1 / 2)))
-
-                    vec_new = np.random.normal(loc=0, scale=1, size=(length_new, 1))  # drawing from normal distribution
-                    betas_new[k][:] = np.transpose(mu_new_post + sigsqd ** (1 / 2) * (S_new).dot(vec_new))
-
-                    # Step 3: Hold betas_old, betas_new, and tau squared constant, calculate sigma squared
-                    comp1 = 0.5 * (yty - ytXo.dot(betas_old[k][:].transpose()) - ytXn.dot(betas_new[k][:].transpose()))
-                    comp2 = 0.5 * (-(betas_old[k][:]).dot(Xoty) + (betas_old[k][:]).dot(XotXo).dot(
-                        betas_old[k][:].transpose()) + (betas_old[k][:]).dot(XotXn).dot(betas_new[k][:].transpose()))
-                    comp3 = 0.5 * (-(betas_new[k][:]).dot(Xnty) + (betas_new[k][:]).dot(XntXo).dot(
-                        betas_old[k][:].transpose()) + (betas_new[k][:]).dot(XntXn).dot(betas_new[k][:].transpose()))
-                    comp4 = 0.5 / tausqd * ((betas_new[k][:]).dot(betas_new[k][:].transpose()))
-                    comp5 = 0.5 * ((betas_old[k][:]).dot(Sigma_old_inverse).dot(betas_old[k][:].transpose()) - (
-                    betas_old[k][:]).dot(Sigma_old_inverse).dot(mu_old))
-                    comp6 = 0.5 * (-np.transpose(mu_old).dot(Sigma_old_inverse).dot(
-                        betas_old[k][:].transpose()) + np.transpose(mu_old).dot(Sigma_old_inverse).dot(mu_old))
-
-                    bstar = comp1 + comp2 + comp3 + comp4 + comp5 + comp6 + b
-                    # Returning a 'not a number' constant if bstar is negative, which would
-                    # cause np.random.gamma to return a ValueError
-                    if bstar < 0:
-                        sigsqd = math.nan
-                    else:
-                        sigsqd = 1 / np.random.gamma(astar, 1 / bstar)
-
-                    sigs[k] = sigsqd
-
-                    # Step 4: Hold betas_old, betas_new, and sigma squared constant, calculate tau squared
-                    btau_star = (1 / (2 * sigsqd)) * (betas_new[k][:].dot(betas_new[k][:].transpose())) + btau
-
-                    tausqd = 1 / np.random.gamma(atau_star, 1 / btau_star)
-                    taus[k] = tausqd
-
-                    # Step 5: for BIC, calculate the Natural Log Likelihood
-                    comp1 = -(n / 2) * np.log(sigsqd)
-                    comp2 = yty - ytXo.dot(betas_old[k][:].transpose()) - ytXn.dot(betas_new[k][:].transpose())
-                    comp3 = -(betas_old[k][:]).dot(Xoty) + (betas_old[k][:]).dot(XotXo).dot(
-                        betas_old[k][:].transpose()) + (betas_old[k][:]).dot(XotXn).dot(betas_new[k][:].transpose())
-                    comp4 = -(betas_new[k][:]).dot(Xnty) + (betas_new[k][:]).dot(XntXo).dot(
-                        betas_old[k][:].transpose()) + (betas_new[k][:]).dot(XntXn).dot(betas_new[k][:].transpose())
-
-                    lik[k] = comp1 - 0.5 / sigsqd * (comp2 + comp3 + comp4)
-
-                # Calculate the evidence (BIC)
-                ev = (mmtx + 1) * np.log(n) - 2 * max(lik)
-
-                # Updated X matrix, not differentiated between old and new though
-                X = X[:, 0:mmtx]
-
-                betas = np.concatenate((betas_old, betas_new), axis=1)
-
-                return betas, sigs, taus, X, ev
-
-
-            # Case 4) Something unexpected happens
-            else:
-                print('Error: No appropriate cases for evaluation found.')
-                return
-
-        # Check if initial model of updated
-        [model, mu_old, sigma_old] = modelBuilder()
-
-        # Prepare phind and xsm if using cubic splines, else match variable names required for gibbs argument
-        if self.kernel == self.kernels[0]:  # == 'Cubic Splines':
-            _, phind, xsm = self._inputs_to_phind(inputs)  # ..., phis=self.phis, kernel=self.kernel) already true
-        elif self.kernel == self.kernels[1]:  # == 'Bernoulli Polynomials':
-            phind = None
-            xsm = inputs
-
-
-        # 'n' is the number of datapoints whereas 'm' is the number of inputs
-        n, m = np.shape(inputs)
-        mrel = n
-        damtx = []
-        evs = []
-
-        # Conversion of Lines 79-100 of emulator_Xin.m
-        if np.logical_not(
-                all([isinstance(index, int) for index in relats_in])):  # checks relats to see if it's an array
-            if sum(np.logical_not(relats_in)).all():
-                relats = np.zeros((sum(np.logical_not(relats_in)), m))
-                ind = 1
-                for i in range(0, m):
-                    if np.logical_not(relats_in[i]):
-                        relats[ind][i] = 1
-                        ind = ind + 1
-                ind_in = m + 1
-                for i in range(0, m - 1):
-                    for j in range(i + 1, m):
-                        if np.logical_not(relats_in[ind_in]):
-                            relats[ind][i] = 1
-                            relats[ind][j] = 1
-                            ind = ind + 1
-                    ind_in = ind_in + 1
-            mrel = sum(np.logical_not(relats_in)).all()
-        else:
-            mrel = sum(np.logical_not(relats_in))
-
-        # Define the number of terms the interaction matrix needs
-        if np.size(mu_old) == 0:
-            num_old_terms = 0
-        else:
-            null, num_old_terms = np.shape(mu_old)
-
-        # End conversion
-
-        # 'ind' is an integer which controls the development of new terms
-        ind = 1
-        greater = 0
-        finished = 0
-        X = []
-
-        while True:
-            # first we have to come up with all combinations of 'm' integers that
-            # sums up to ind (by twos since we only do two-way interactions)
-            if ind == 1:
-                i_list = [0]
-            else:
-                i_list = np.arange(0, math.floor(ind / 2) + 0.1, 1)
-                i_list = i_list[::-1]
-                # adding 0.1 to correct index list generation using floor function
-
-            for i in i_list:
-
-                if m > 1:
-                    vecs = np.zeros(m)
-                    vecs[0] = ind - i
-                    vecs[1] = i
-                    vecs = np.unique(perms(vecs), axis=0)
-
-                    killrow = []
-                    for t in range(mrel):
-                        for iter in range(vecs.shape[0]):
-                            if np.array_equal(relats_in[t, :].ravel().nonzero(), vecs[iter, :].ravel().nonzero()):
-                                killrow.append(iter)
-                    vecs = np.delete(vecs, killrow, 0)
-
+            while True:
+                # first we have to come up with all combinations of 'm' integers that
+                # sums up to ind (by twos since we only do two-way interactions)
+                if ind == 1:
+                    i_list = [0]
                 else:
-                    vecs = ind
+                    i_list = np.arange(0, math.floor(ind / 2) + 0.1, 1)
+                    i_list = i_list[::-1]
+                    # adding 0.1 to correct index list generation using floor function
 
-                if np.size(damtx) == 0:
-                    damtx = vecs
-                else:
-                    if np.shape(damtx) == () or np.shape(vecs) == ():  # part of fix for single input model
-                        if np.shape(damtx) == ():
-                            damtx = np.array([damtx, vecs])
-                            damtx = np.reshape(damtx, [len(damtx), 1])
+                for i in i_list:
+
+                    if m > 1:
+                        vecs = np.zeros(m)
+                        vecs[0] = ind - i
+                        vecs[1] = i
+                        vecs = np.unique(perms(vecs), axis=0)
+
+                        killrow = []
+                        for t in range(mrel):
+                            for iter in range(vecs.shape[0]):
+                                if np.array_equal(relats_in[t, :].ravel().nonzero(), vecs[iter, :].ravel().nonzero()):
+                                    killrow.append(iter)
+                        vecs = np.delete(vecs, killrow, 0)
+
+                    else:
+                        vecs = ind
+
+                    if np.size(damtx) == 0:
+                        damtx = vecs
+                    else:
+                        if np.shape(damtx) == () or np.shape(vecs) == ():  # part of fix for single input model
+                            if np.shape(damtx) == ():
+                                damtx = np.array([damtx, vecs])
+                                damtx = np.reshape(damtx, [len(damtx), 1])
+                            else:
+                                damtx = np.append(damtx, vecs)
+                                damtx = np.reshape(damtx, [len(damtx), 1])
                         else:
-                            damtx = np.append(damtx, vecs)
-                            damtx = np.reshape(damtx, [len(damtx), 1])
-                    else:
-                        damtx = np.concatenate((damtx, vecs), axis=0)
+                            damtx = np.concatenate((damtx, vecs), axis=0)
 
-                interaction_matrix_length, null = np.shape(damtx)
+                    interaction_matrix_length, null = np.shape(damtx)
 
-                if num_old_terms - 1 <= interaction_matrix_length:  # Make sure number of terms is appropriate
+                    if num_old_terms - 1 <= interaction_matrix_length:  # Make sure number of terms is appropriate
 
-                    betas, null, null, X, ev \
-                        = gibbs_Xin_update(sigsqd0, inputs, data, phis, X, damtx, a, b, atau \
-                                           , btau, phind, xsm, mu_old, sigma_old, draws=draws)
+                        betas, null, null, X, ev \
+                            = gibbs_Xin_update(sigsqd0, inputs, data, phis, X, damtx, a, b, atau \
+                                               , btau, phind, xsm, mu_old, sigma_old, draws=draws)
 
-                    # Boolean implementation of the AIC if passed as 'True'
-                    if aic:
-                        if np.shape(damtx) == ():  # for single input models
-                            dam = 1
+                        # Boolean implementation of the AIC if passed as 'True'
+                        if aic:
+                            if np.shape(damtx) == ():  # for single input models
+                                dam = 1
+                            else:
+                                dam, null = np.shape(damtx)
+
+                            ev = ev + (2 - np.log(n)) * dam
+
+                        print(ind, float(ev))
+
+                        # Keep running list of the evidence values for the sampling
+                        if np.size(evs) == 0:
+                            evs = ev
                         else:
-                            dam, null = np.shape(damtx)
+                            evs = np.concatenate((evs, ev))
 
-                        ev = ev + (2 - np.log(n)) * dam
+                        # ev (evidence) is the BIC and the smaller the better
 
-                    print(ind, float(ev))
+                        if ev == min(evs):
+                            betas_best = betas
+                            mtx = damtx
+                            greater = 1
 
-                    # Keep running list of the evidence values for the sampling
-                    if np.size(evs) == 0:
-                        evs = ev
-                    else:
-                        evs = np.concatenate((evs, ev))
+                        elif greater <= tolerance:
+                            greater = greater + 1
 
-                    # ev (evidence) is the BIC and the smaller the better
+                        else:
+                            finished = 1
+                            self.built = True
+                            break
 
-                    if ev == min(evs):
-                        betas_best = betas
-                        mtx = damtx
-                        greater = 1
+                        if m == 1:
+                            break
+                if finished != 0:
+                    break
 
-                    elif greater <= tolerance:
-                        greater = greater + 1
+                ind = ind + 1
 
-                    else:
-                        finished = 1
-                        self.built = True
-                        break
+                if ind > len(phis):
+                    break
 
-                    if m == 1:
-                        break
-            if finished != 0:
-                break
+            # Implementation of 'gimme' feature
+            if gimmie:
+                betas_best = betas
+                mtx = damtx
 
-            ind = ind + 1
-
-            if ind > len(phis):
-                break
-
-        # Implementation of 'gimme' feature
-        if gimmie:
-            betas_best = betas
-            mtx = damtx
-
-        return betas_best, mtx, evs
+            return betas_best, mtx, evs
 
